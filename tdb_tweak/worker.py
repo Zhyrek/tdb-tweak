@@ -19,14 +19,16 @@ class _Worker(QObject):
     status = pyqtSignal(int, str)
     opt_progress = pyqtSignal(int, object)
     opt_finished = pyqtSignal(int, object)
+    probe_ready = pyqtSignal(object, object)
+    scan_ready = pyqtSignal(object)
 
     def __init__(self):
         super().__init__()
         self.engine: Optional[Engine] = None
         self.cancel_events: Dict[int, threading.Event] = {}
 
-    @pyqtSlot(int, str, object, object, object)
-    def run(self, job: int, compute_text: str, param_names, values, request):
+    @pyqtSlot(int, str, object, object, object, object, bool)
+    def run(self, job: int, compute_text: str, param_names, values, request, zpf, warm):
         ev = self.cancel_events.get(job)
         if ev is not None and ev.is_set():
             self.cancelled.emit(job)
@@ -37,7 +39,13 @@ class _Worker(QObject):
             if self.engine.set_database(compute_text, list(param_names)):
                 self.status.emit(job, "database structure changed: models will be compiled on this run")
             res = self.engine.run(request, values, cancel=ev,
-                                  progress=lambda r: self.progress.emit(job, r))
+                                  progress=lambda r: self.progress.emit(job, r), warm=warm)
+            if zpf:
+                try:
+                    from .zpfscore import zpf_score
+                    res.zpf = zpf_score(self.engine, request, values, zpf)
+                except Exception as ex:
+                    res.message = (res.message + "; " if res.message else "") + f"ZPF score: {ex}"
             self.finished.emit(job, res)
         except Cancelled:
             self.cancelled.emit(job)
@@ -45,6 +53,29 @@ class _Worker(QObject):
             self.failed.emit(job, f"{type(ex).__name__}: {ex}\n\n{traceback.format_exc()}")
         finally:
             self.cancel_events.pop(job, None)
+
+    @pyqtSlot(str, object, object, object, object)
+    def run_probe(self, compute_text: str, param_names, values, request, point):
+        """One equilibrium; queued behind any running job (it never cancels one)."""
+        try:
+            if self.engine is None:
+                self.engine = Engine()
+            self.engine.set_database(compute_text, list(param_names))
+            T, x = point
+            self.probe_ready.emit(point, self.engine.point(request, values, T, x))
+        except Exception as ex:
+            self.probe_ready.emit(point, f"{type(ex).__name__}: {ex}")
+
+    @pyqtSlot(str, object, object, object)
+    def run_scan(self, compute_text: str, param_names, values, request):
+        try:
+            if self.engine is None:
+                self.engine = Engine()
+            self.engine.set_database(compute_text, list(param_names))
+            from .artifacts import scan
+            self.scan_ready.emit(scan(self.engine, request.elements, values, phases=request.phases))
+        except Exception as ex:
+            self.scan_ready.emit(f"{type(ex).__name__}: {ex}")
 
     @pyqtSlot(int, str, object, object, object, object)
     def run_opt(self, job: int, compute_text: str, param_names, values, request, spec):
@@ -59,6 +90,20 @@ class _Worker(QObject):
             variables, target, settings = spec
             res = optimize_invariant(self.engine, request, values, variables, target, settings, cancel=ev,
                                      progress=lambda it: self.opt_progress.emit(job, it))
+            # what else might the new parameters have broken?
+            try:
+                from .artifacts import scan
+                final = dict(values)
+                final.update(res.iterations[-1].values)
+                systems = {}
+                for t in res.targets:
+                    systems.setdefault(tuple(t.req.elements), t.req)
+                res.artifacts = []
+                for els, rq in systems.items():
+                    res.artifacts += scan(self.engine, els, final, phases=rq.phases)
+            except Exception as ex:
+                res.artifacts = []
+                res.message += f" (artifact scan failed: {ex})"
             self.opt_finished.emit(job, res)
         except Cancelled:
             self.cancelled.emit(job)
@@ -77,8 +122,12 @@ class MapRunner(QObject):
     status = pyqtSignal(str)
     opt_progress = pyqtSignal(object)
     opt_finished = pyqtSignal(object)
-    _submit = pyqtSignal(int, str, object, object, object)
+    _submit = pyqtSignal(int, str, object, object, object, object, bool)
     _submit_opt = pyqtSignal(int, str, object, object, object, object)
+    _submit_probe = pyqtSignal(str, object, object, object, object)
+    probe_ready = pyqtSignal(object, object)
+    _submit_scan = pyqtSignal(str, object, object, object)
+    scan_ready = pyqtSignal(object)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -88,6 +137,10 @@ class MapRunner(QObject):
         self._worker.moveToThread(self._thread)
         self._submit.connect(self._worker.run)
         self._submit_opt.connect(self._worker.run_opt)
+        self._submit_probe.connect(self._worker.run_probe)
+        self._submit_scan.connect(self._worker.run_scan)
+        self._worker.scan_ready.connect(self.scan_ready)
+        self._worker.probe_ready.connect(self.probe_ready)
         self._worker.opt_progress.connect(lambda j, it: self.opt_progress.emit(it) if j == self._job else None)
         self._worker.opt_finished.connect(self._on_opt_finished)
         self._worker.progress.connect(self._on_progress)
@@ -100,12 +153,15 @@ class MapRunner(QObject):
         self.running = False
         self.optimizing = False
 
-    def submit(self, compute_text: str, param_names: Sequence[str], values: Dict[str, float], request: MapRequest):
+    def submit(self, compute_text: str, param_names: Sequence[str], values: Dict[str, float], request: MapRequest,
+               zpf=None, warm: bool = False):
+        """Map ``request``; with ZPF datasets, the result also carries their ZPF score (``result.zpf``)."""
         self.cancel()
         self._job += 1
         self._worker.cancel_events[self._job] = threading.Event()
         self.running = True
-        self._submit.emit(self._job, compute_text, list(param_names), dict(values), request)
+        self._submit.emit(self._job, compute_text, list(param_names), dict(values), request,
+                          [d for d in (zpf or []) if d.enabled], bool(warm))
 
     def submit_opt(self, compute_text: str, param_names: Sequence[str], values: Dict[str, float],
                    request: MapRequest, spec):
@@ -116,6 +172,12 @@ class MapRunner(QObject):
         self.running = True
         self.optimizing = True
         self._submit_opt.emit(self._job, compute_text, list(param_names), dict(values), request, spec)
+
+    def submit_probe(self, compute_text: str, param_names, values, request, T: float, x: Dict[str, float]):
+        self._submit_probe.emit(compute_text, list(param_names), dict(values), request, (T, dict(x)))
+
+    def submit_scan(self, compute_text: str, param_names, values, request):
+        self._submit_scan.emit(compute_text, list(param_names), dict(values), request)
 
     def _on_opt_finished(self, job, res):
         if job == self._job:

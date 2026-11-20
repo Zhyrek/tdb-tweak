@@ -138,22 +138,40 @@ class MainWindow(QMainWindow):
         self.views: List[SavedView] = []
         self._active_view: Optional[int] = None
         self.cache = ResultCache()
-        self._queue: List[Tuple[MapRequest, str]] = []   # (request, label) still to map ("Map all views")
+        self._queue: List[Tuple] = []  # (request, label[, values]) still to map ("Map all views", ghost maps)
+        self.checkpoint: Optional[Dict] = None   # {"vv": {...}, "coef": {...}} parameter snapshot for the ghost
+        self.ghost_on = True
+        self._nudge_timer = QTimer(self)
+        self._nudge_timer.setSingleShot(True)
+        self._nudge_timer.setInterval(350)
+        self._nudge_timer.timeout.connect(lambda: self.redraw(fast=True))
         self._pending = None           # (request key, stamp, label) of the running job
         self._zpf_artists = []
         self._picked_T: Optional[float] = None
         self._map_started = 0.0
 
         self.runner = MapRunner(self)
+        from .pool import MapPool
+        self.pool = MapPool()
+        self._pool_jobs: List[tuple] = []          # (future, request key, stamp, label)
+        self._pool_timer = QTimer(self)
+        self._pool_timer.setInterval(100)
+        self._pool_timer.timeout.connect(self._poll_pool)
         self.runner.progress.connect(self._on_progress)
         self.runner.finished.connect(self._on_finished)
         self.runner.failed.connect(self._on_failed)
         self.runner.cancelled.connect(self._on_cancelled)
         self.runner.status.connect(lambda s: self.statusBar().showMessage(s, 8000))
+        self.runner.probe_ready.connect(self._on_probe)
+        self.runner.scan_ready.connect(self._on_scan)
 
         self._build_ui()
         self._build_menus()
         self._update_kind_widgets()
+        self._autosave_timer = QTimer(self)
+        self._autosave_timer.setInterval(60_000)
+        self._autosave_timer.timeout.connect(self.autosave)
+        self._autosave_timer.start()
 
     # ===================================================================================== UI construction
     def _build_ui(self):
@@ -161,6 +179,7 @@ class MainWindow(QMainWindow):
         self.params = ParamPanel()
         self.params.changed.connect(self._on_values_changed)
         self.params.committed.connect(self._on_committed)
+        self.params.nudged.connect(self._nudge_timer.start)
         self.params.subsystemRequested.connect(self.choose_subsystem)
         dock = QDockWidget("Parameters", self)
         dock.setObjectName("params")
@@ -375,6 +394,8 @@ class MainWindow(QMainWindow):
         self._act(fm, "Open TDB…", self.open_tdb_dialog, QKeySequence.StandardKey.Open)
         self._act(fm, "Save TDB", self.save_tdb, QKeySequence.StandardKey.Save)
         self._act(fm, "Save TDB As…", self.save_tdb_as, QKeySequence("Ctrl+Shift+S"))
+        self._act(fm, "Save as Next Version", self.save_next_version, QKeySequence("Ctrl+Alt+V"))
+        self._act(fm, "Show Changes…", self.show_changes, QKeySequence("Ctrl+D"))
         fm.addSeparator()
         self._act(fm, "Open Project…", self.open_project_dialog, QKeySequence("Ctrl+Shift+O"))
         self._act(fm, "Save Project…", self.save_project_dialog, QKeySequence("Ctrl+Alt+S"))
@@ -389,6 +410,9 @@ class MainWindow(QMainWindow):
         em.addAction(redo)
         em.addSeparator()
         self._act(em, "Revert All Edits", self.revert_all)
+        em.addSeparator()
+        self._act(em, "Save Checkpoint", self.save_checkpoint, QKeySequence("Ctrl+K"))
+        self._act(em, "Revert to Checkpoint", self.revert_to_checkpoint, QKeySequence("Ctrl+Shift+K"))
         self._act(em, "Elements to Edit…", self.choose_subsystem)
         vm = mb.addMenu("&Diagram")
         self._act(vm, "Redraw", self.redraw, QKeySequence("F5"))
@@ -396,6 +420,10 @@ class MainWindow(QMainWindow):
         a.setVisible(False)
         self._act(vm, "Cancel Mapping", self.runner.cancel, QKeySequence("Esc"))
         self._act(vm, "Reset View", self.reset_view, QKeySequence("Ctrl+0"))
+        self.ghost_act = self._act(vm, "Show Checkpoint Ghost", self.toggle_ghost, QKeySequence("Ctrl+G"))
+        self.ghost_act.setCheckable(True)
+        self.ghost_act.setChecked(True)
+        self._act(vm, "Check for Artifacts", self.check_artifacts)
         self._act(vm, "Export Figure…", self.export_figure)
         hm = mb.addMenu("&Help")
         self._act(hm, "About", lambda: QMessageBox.about(
@@ -434,6 +462,7 @@ class MainWindow(QMainWindow):
         self.result = None
         self.cache.clear()
         self._queue = []
+        self.checkpoint = {"vv": dict(doc.vv_values), "coef": dict(doc.coef_values)}
         self.excluded_phases = set()
         els = doc.element_list()
         self.subsystem = [e for e in (subsystem or els) if e in els]
@@ -491,6 +520,86 @@ class MainWindow(QMainWindow):
 
     def revert_all(self):
         self.params.revert_all()
+
+    @staticmethod
+    def next_version_path(path: str) -> str:
+        import re as _re
+        stem, ext = os.path.splitext(path)
+        m = _re.match(r"^(.*)_v(\d+)$", stem)
+        base, n = (m.group(1), int(m.group(2)) + 1) if m else (stem, 2)
+        while os.path.exists(f"{base}_v{n}{ext}"):
+            n += 1
+        return f"{base}_v{n}{ext}"
+
+    def save_next_version(self):
+        if self.doc is None:
+            return
+        if not self.doc.path:
+            self.save_tdb_as()
+            return
+        path = self.next_version_path(self.doc.path)
+        if self._save_to(path):
+            self.statusBar().showMessage(f"Saved as {os.path.basename(path)}", 6000)
+
+    def show_changes(self):
+        """A unified diff of the edits against the file as it was opened (or last saved)."""
+        if self.doc is None:
+            return
+        import difflib
+        name = os.path.basename(self.doc.path or "untitled.tdb")
+        diff = "".join(difflib.unified_diff(self.doc.text.splitlines(keepends=True),
+                                            self.doc.render().splitlines(keepends=True),
+                                            fromfile=f"{name} (as opened/saved)", tofile=f"{name} (edited)", n=0))
+        dlg = QDialog(self)
+        dlg.setWindowTitle(f"Changes — {self.doc.modified_count()} values")
+        txt = QPlainTextEdit(diff or "No changes.")
+        txt.setReadOnly(True)
+        f = QFont("Menlo")
+        f.setStyleHint(QFont.StyleHint.Monospace)
+        txt.setFont(f)
+        txt.setLineWrapMode(QPlainTextEdit.LineWrapMode.NoWrap)
+        lay = QVBoxLayout(dlg)
+        lay.addWidget(txt)
+        bb = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
+        bb.rejected.connect(dlg.reject)
+        lay.addWidget(bb)
+        dlg.resize(1000, 600)
+        dlg.exec()
+
+    # autosave / last session ------------------------------------------------------------------------
+    @staticmethod
+    def session_path() -> str:
+        from PyQt6.QtCore import QStandardPaths
+        d = os.environ.get("TDBTWEAK_SESSION_DIR") or \
+            QStandardPaths.writableLocation(QStandardPaths.StandardLocation.AppDataLocation) or \
+            os.path.join(os.path.expanduser("~"), ".tdb-tweak")
+        os.makedirs(d, exist_ok=True)
+        return os.path.join(d, "last_session.tdbtweak")
+
+    def autosave(self, keep_edits: bool = True):
+        """Write the session; periodic autosaves keep unsaved edits (crash recovery)."""
+        if self.doc is None or not self.doc.path:
+            return
+        try:
+            d = self.project_dict()
+            if not keep_edits:
+                d.pop("unsaved_edits", None)
+            with open(self.session_path(), "w") as f:
+                json.dump(d, f)
+        except Exception as ex:
+            self._log(f"autosave failed: {ex}")
+
+    def restore_session(self) -> bool:
+        p = self.session_path()
+        if not os.path.exists(p):
+            return False
+        try:
+            self.open_project(p)
+            self._log(f"reopened the last session ({p})")
+            return self.doc is not None
+        except Exception as ex:
+            self._log(f"could not reopen the last session: {ex}")
+            return False
 
     def _update_title(self):
         name = os.path.basename(self.doc.path) if self.doc and self.doc.path else "untitled"
@@ -699,7 +808,9 @@ class MainWindow(QMainWindow):
         req = self.build_request()
         return request_key(req) if req is not None else None
 
-    def redraw(self):
+    def redraw(self, fast: bool = False):
+        """Map the current diagram. ``fast``: warm start from the previous map (used after nudges and commits);
+        an explicit Redraw (F5) always maps in full."""
         if self.doc is None:
             return
         req, err = self.request_from_settings(self.diagram_settings())
@@ -707,16 +818,22 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "Diagram", err)
             return
         self._queue = []
-        self._map(req, "")
+        self._map(req, "", fast=bool(fast))
 
-    def _map(self, req: MapRequest, label: str, from_queue: bool = False) -> bool:
-        """Show the cached map for ``req`` with the current values, or start mapping it.
+    def _map(self, req: MapRequest, label: str, from_queue: bool = False, values: Optional[Dict] = None,
+             fast: bool = False) -> bool:
+        """Show the cached map for ``req`` with the current values (or ``values``), or start mapping it.
 
         Returns True when a mapping job was started."""
-        key, stamp = request_key(req), self._stamp()
+        ghost = values is not None
+        if values is None:
+            values = self.doc.parameter_values()
+        key, stamp = request_key(req), values_stamp(self.doc.compute_text(), values)
         hit = self.cache.get(key, stamp)
+        if hit is not None and getattr(hit, "warm", False) and not fast and not ghost:
+            hit = None                                       # an explicit redraw replaces a fast (warm) map
         if hit is not None:
-            if key == self._current_key():
+            if not ghost and key == self._current_key():
                 self.result = hit
                 self._update_state_label(done=f"up to date ({hit.n_lines} lines; mapped in {hit.seconds:.2f} s)")
                 self.replot()
@@ -725,12 +842,13 @@ class MainWindow(QMainWindow):
             if self._pending[0] == key and self._pending[1] == stamp:
                 return True                                  # already mapping exactly this
             if self._pending[4]:                             # interrupting "Map all": do that one later
-                self._queue.insert(0, (self._pending[3], self._pending[2]))
-        self._queue = [(r, l) for r, l in self._queue if request_key(r) != key]
-        self._pending = (key, stamp, label, req, from_queue)
+                self._queue.insert(0, (self._pending[3], self._pending[2], self._pending[5]))
+        self._queue = [q for q in self._queue if not (request_key(q[0]) == key and
+                                                       (len(q) > 2 and q[2] is not None) == ghost)]
+        self._pending = (key, stamp, label, req, from_queue, values if ghost else None)
         self._map_started = time.perf_counter()
-        self.runner.submit(self.doc.compute_text(), list(self.doc.parameter_values().keys()),
-                           self.doc.parameter_values(), req)
+        self.runner.submit(self.doc.compute_text(), list(values.keys()), values, req, zpf=self.zpf,
+                           warm=fast and not ghost)
         self.cancel_btn.setEnabled(True)
         self.state_lbl.setText(f"<span style='color:#0a58ca'>● mapping{' ' + label if label else ''}…</span>")
         self._refresh_view_buttons()
@@ -738,26 +856,40 @@ class MainWindow(QMainWindow):
 
     def _next_in_queue(self):
         while self._queue:
-            req, label = self._queue.pop(0)
+            item = self._queue.pop(0)
+            req, label = item[0], item[1]
+            values = item[2] if len(item) > 2 else None
             n_left = len(self._queue)
-            if self._map(req, f"{label} ({n_left} more queued)" if n_left else label, from_queue=True):
+            if self._map(req, f"{label} ({n_left} more queued)" if n_left else label, from_queue=True,
+                         values=values):
                 return
 
     def _on_progress(self, res: MapResult):
         label = self._pending[2] if self._pending else ""
         self.state_lbl.setText(f"<span style='color:#0a58ca'>● mapping{' ' + label if label else ''}… "
                                f"{res.n_lines} lines, {time.perf_counter() - self._map_started:.1f} s</span>")
-        if request_key(res.request) == self._current_key():
+        if request_key(res.request) == self._current_key() and self._pending is not None and self._pending[5] is None:
             self.result = res
             self.replot()
 
     def _on_finished(self, res: MapResult):
         self.cancel_btn.setEnabled(False)
         key = request_key(res.request)
+        was_ghost = self._pending is not None and self._pending[5] is not None
         if self._pending is not None and self._pending[0] == key:
             self.cache.put(key, self._pending[1], res)
         self._pending = None
-        msg = f"{res.n_lines} lines, {len(res.invariants)} invariants in {res.seconds:.2f} s"
+        if was_ghost:
+            self.replot()
+            self._next_in_queue()
+            return
+        msg = f"{res.n_lines} lines, {len(res.invariants)} invariants in {res.seconds:.2f} s" + \
+            (" (fast)" if getattr(res, "warm", False) else "")
+        if res.zpf is not None and res.zpf.n:
+            msg += f"  ·  {res.zpf.text()}"
+            ck = self._ghost_result(res.request)
+            if ck is not None and ck.zpf is not None and ck.zpf.n:
+                msg += f" (checkpoint {ck.zpf.rms:.0f})"
         if res.message:
             msg += f"  ({res.message})"
         self._log(f"map {'-'.join(res.request.elements)} ({res.request.kind}"
@@ -766,6 +898,11 @@ class MainWindow(QMainWindow):
             self.result = res
             self.replot()
             self.opt.refresh_invariants()
+            self._queue_ghost(res.request)
+            if res.zpf is not None:
+                self._refresh_zpf_list()
+                self.state_lbl.setToolTip("Worst ZPF points (driving force, J/mol):\n" + "\n".join(
+                    f"{a:8.0f}  {b}" for a, b in res.zpf.worst[:6]))
         self._update_state_label(done=msg)
         self._next_in_queue()
 
@@ -795,7 +932,7 @@ class MainWindow(QMainWindow):
 
     def _on_committed(self):
         if self.auto_cb.isChecked():
-            QTimer.singleShot(0, self.redraw)
+            QTimer.singleShot(0, lambda: self.redraw(fast=True))
 
     def _update_state_label(self, done: Optional[str] = None):
         self._sync_active_view()
@@ -832,6 +969,122 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage("Not shown (units differ from the diagram's): " + ", ".join(skipped), 8000)
         return out
 
+    # ----------------------------------------------------------------------------------- equilibrium probe
+    def probe(self, T: float, x: Dict[str, float]):
+        if self.doc is None:
+            return
+        req = self.build_request()
+        if req is None:
+            return
+        from PyQt6.QtGui import QCursor
+        self._probe_pos = QCursor.pos()
+        self.statusBar().showMessage("computing the equilibrium…", 3000)
+        vals = self.doc.parameter_values()
+        self.runner.submit_probe(self.doc.compute_text(), list(vals), vals, req, T, x)
+
+    def _on_probe(self, point, result):
+        from PyQt6.QtWidgets import QToolTip
+        T, x = point
+        tu = self.t_unit.currentText()
+        head = f"Equilibrium at {U.t_from_K(T, tu):.6g} {tu}, " + \
+            ", ".join(f"x({e.capitalize()}) = {v * 100:.3g} %" for e, v in x.items())
+        if isinstance(result, str):
+            text = head + "\n" + result
+        else:
+            lines = [head]
+            for ph, frac, comp in sorted(result, key=lambda t: -t[1]):
+                c = ", ".join(f"{e.capitalize()} {v * 100:.4g}" for e, v in comp.items())
+                lines.append(f"  {ph:<14s} {frac * 100:6.2f} %   ({c} at.%)")
+            text = "\n".join(lines)
+        self._log(text.replace("\n", " | "))
+        QToolTip.showText(getattr(self, "_probe_pos", self.canvas.mapToGlobal(self.canvas.rect().center())),
+                          f"<pre>{text}</pre>", self.canvas, self.canvas.rect(), 15000)
+
+    def check_artifacts(self):
+        if self.doc is None:
+            return
+        req = self.build_request()
+        if req is None:
+            return
+        self.statusBar().showMessage("checking for artifacts (solids at 4000-6000 K, high-T miscibility gaps, "
+                                     "liquid at 300 K)…", 5000)
+        vals = self.doc.parameter_values()
+        self.runner.submit_scan(self.doc.compute_text(), list(vals), vals, req)
+
+    def _on_scan(self, findings):
+        if isinstance(findings, str):
+            QMessageBox.warning(self, "Artifact check", findings)
+            return
+        if not findings:
+            QMessageBox.information(self, "Artifact check", "No artifacts found: no solid stable at 4000–6000 K, no "
+                                    "high-temperature miscibility gap, no liquid at 300 K.")
+            return
+        for f in findings:
+            self._log(f"artifact check ({f.severity}): {f.text}")
+        QMessageBox.warning(self, "Artifact check", "\n".join(("⚠ " if f.severity == "warning" else "• ") + f.text
+                                                              for f in findings))
+
+    # ----------------------------------------------------------------------------------- checkpoint & ghost
+    def checkpoint_values(self) -> Optional[Dict[str, float]]:
+        """The checkpoint as parameter values of the current compute database."""
+        if self.doc is None or self.checkpoint is None:
+            return None
+        vals = {}
+        for name in self.doc.parameter_values():
+            if name in self.doc.vvdefs:
+                vals[name] = self.checkpoint["vv"].get(name, self.doc.vv_orig[name])
+            else:
+                rid = next((r.rid for r in self.doc.rows if r.symbol == name), None)
+                vals[name] = self.checkpoint["coef"].get(rid, self.doc.coef_orig.get(rid, 0.0))
+        return vals
+
+    def _ghost_result(self, req) -> Optional[MapResult]:
+        if not self.ghost_on or req is None:
+            return None
+        ck = self.checkpoint_values()
+        if ck is None or ck == self.doc.parameter_values():
+            return None
+        return self.cache.get(request_key(req), values_stamp(self.doc.compute_text(), ck))
+
+    def _queue_ghost(self, req):
+        if not self.ghost_on or self.doc is None:
+            return
+        ck = self.checkpoint_values()
+        if ck is None or ck == self.doc.parameter_values():
+            return
+        if self.cache.get(request_key(req), values_stamp(self.doc.compute_text(), ck)) is None:
+            self._queue.insert(0, (req, "checkpoint ghost", ck))
+
+    def save_checkpoint(self):
+        if self.doc is None:
+            return
+        self.checkpoint = {"vv": dict(self.doc.vv_values), "coef": dict(self.doc.coef_values)}
+        self._log("checkpoint saved: the ghost now shows these parameters")
+        self.statusBar().showMessage("Checkpoint saved (Ctrl+Shift+K reverts to it)", 4000)
+        self.replot()
+
+    def revert_to_checkpoint(self):
+        if self.doc is None or self.checkpoint is None:
+            return
+        from .paramtable import apply_symbol_values
+        vals = {n: v for n, v in self.checkpoint["vv"].items()}
+        for r in self.doc.rows:
+            if r.kind == "COEF" and r.rid in self.checkpoint["coef"]:
+                vals[r.symbol] = self.checkpoint["coef"][r.rid]
+        n = apply_symbol_values(self.params, vals, "revert to checkpoint")
+        self._log(f"reverted {n} values to the checkpoint")
+        if n:
+            self.redraw()
+
+    def toggle_ghost(self):
+        self.ghost_on = self.ghost_act.isChecked()
+        if self.ghost_on:
+            req = self.build_request()
+            if req is not None and not self.runner.running:
+                self._queue_ghost(req)
+                self._next_in_queue()
+        self.replot()
+
     def replot(self):
         if self.doc is None:
             self.figure.clear()
@@ -852,7 +1105,9 @@ class MainWindow(QMainWindow):
         limits = self._zoom
         images = self._visible_images(view)
         try:
-            ax, self._zpf_artists = draw_all(self.figure, view, res, self.zpf, images, self.colors, limits)
+            ghost = self._ghost_result(self.build_request())
+            ax, self._zpf_artists = draw_all(self.figure, view, res, self.zpf, images, self.colors, limits,
+                                             ghost=ghost)
         except Exception as ex:
             self._log(f"drawing failed: {ex}")
             return
@@ -1002,6 +1257,8 @@ class MainWindow(QMainWindow):
         self.views.append(SavedView(name.strip(), g, [list(zoom[0]), list(zoom[1])] if zoom else None))
         self._active_view = len(self.views) - 1
         self._rebuild_views_bar()
+        if len(self.views) >= 2:
+            self.pool.warm_up()              # start the "Map all views" processes in the background
 
     def _view_menu(self, i: int, pos):
         m = QMenu(self)
@@ -1066,9 +1323,53 @@ class MainWindow(QMainWindow):
         if not jobs:
             self.statusBar().showMessage("Every saved view is already mapped with the current values.", 5000)
             return
+        if len(jobs) >= 2:
+            try:
+                self._map_in_pool(jobs)
+                return
+            except Exception as ex:
+                self._log(f"parallel mapping unavailable ({ex}); mapping one after another")
         self._queue = jobs
         if not self.runner.running:
             self._next_in_queue()
+
+    def _map_in_pool(self, jobs):
+        vals = self.doc.parameter_values()
+        text = self.doc.compute_text()
+        stamp = values_stamp(text, vals)
+        for req, label in jobs:
+            fut = self.pool.submit(text, list(vals), vals, req, zpf=self.zpf)
+            self._pool_jobs.append((fut, request_key(req), stamp, label))
+        self._pool_total = len(self._pool_jobs)
+        self.state_lbl.setText(f"<span style='color:#0a58ca'>● mapping {len(jobs)} views in parallel…</span>")
+        self._pool_timer.start()
+
+    def _poll_pool(self):
+        still = []
+        for fut, key, stamp, label in self._pool_jobs:
+            if not fut.done():
+                still.append((fut, key, stamp, label))
+                continue
+            try:
+                res = fut.result()
+            except Exception as ex:
+                self._log(f"map of view “{label}” failed: {ex}")
+                continue
+            self.cache.put(key, stamp, res)
+            self._log(f"map {label}: {res.n_lines} lines in {res.seconds:.2f} s (parallel)")
+            if key == self._current_key() and stamp == self._stamp():
+                self.result = res
+                self.replot()
+                self.opt.refresh_invariants()
+        self._pool_jobs = still
+        self._refresh_view_buttons()
+        if still:
+            done = self._pool_total - len(still)
+            self.state_lbl.setText(f"<span style='color:#0a58ca'>● mapping views in parallel… {done}/"
+                                   f"{self._pool_total}</span>")
+        else:
+            self._pool_timer.stop()
+            self._update_state_label(done=f"{self._pool_total} views mapped")
 
     def _on_pick(self, ev):
         art = ev.artist
@@ -1255,7 +1556,7 @@ class MainWindow(QMainWindow):
             self._log(f"ZPF: {m}")
         self._log(f"ZPF: loaded {len(new)} datasets")
         self._refresh_zpf_list()
-        self.replot()
+        self._zpf_changed()
 
     def remove_zpf(self):
         i = self.zpf_list.currentRow()
@@ -1272,12 +1573,18 @@ class MainWindow(QMainWindow):
     def _refresh_zpf_list(self):
         self.zpf_list.blockSignals(True)
         self.zpf_list.clear()
+        score = self.result.zpf if (self.result is not None and getattr(self.result, "zpf", None)) else None
         for d in self.zpf:
             n = len(d.tielines)
-            it = QListWidgetItem(f"{d.label}  [{'-'.join(sorted(d.elements))}, {n} tie-lines]")
+            txt = f"{d.label}  [{'-'.join(sorted(d.elements))}, {n} tie-lines]"
+            if score is not None and d.path in score.per_dataset:
+                rms, k = score.per_dataset[d.path]
+                txt += f"  —  {rms:.0f} J/mol"
+            it = QListWidgetItem(txt)
             it.setFlags(it.flags() | Qt.ItemFlag.ItemIsUserCheckable)
             it.setCheckState(Qt.CheckState.Checked if d.enabled else Qt.CheckState.Unchecked)
-            it.setToolTip(f"{d.path}\nphases: {', '.join(d.phases)}\n{d.comment}")
+            it.setToolTip(f"{d.path}\nphases: {', '.join(d.phases)}\n{d.comment}\n"
+                          "J/mol: RMS driving force of its points against the current parameters (0 = perfect)")
             self.zpf_list.addItem(it)
         self.zpf_list.blockSignals(False)
         self._refresh_zpf_temps()
@@ -1285,7 +1592,14 @@ class MainWindow(QMainWindow):
     def _on_zpf_toggled(self, item: QListWidgetItem):
         self.zpf[self.zpf_list.row(item)].enabled = item.checkState() == Qt.CheckState.Checked
         self._refresh_zpf_temps()
+        self._zpf_changed()
+
+    def _zpf_changed(self):
+        """Cached maps carry the ZPF score of the data loaded when they were made: map again."""
+        self.cache.clear()
         self.replot()
+        if self.result is not None and self.doc is not None:
+            self.redraw()
 
     def _refresh_zpf_temps(self):
         self.zpf_temps.clear()
@@ -1327,6 +1641,8 @@ class MainWindow(QMainWindow):
                       "lower": self.params.show_lower.isChecked()},
         }
         if self.doc is not None:
+            import hashlib
+            d["tdb_sha1"] = hashlib.sha1(self.doc.text.encode()).hexdigest()
             d["unsaved_edits"] = {
                 "vv": {k: v for k, v in self.doc.vv_values.items() if v != self.doc.vv_orig[k]},
                 "coef": {str(k): v for k, v in self.doc.coef_values.items() if v != self.doc.coef_orig[k]},
@@ -1387,6 +1703,11 @@ class MainWindow(QMainWindow):
         self.zpf_tol.setValue(d.get("zpf_tolerance", 5))
         self._refresh_zpf_list()
         ed = d.get("unsaved_edits", {})
+        import hashlib
+        if self.doc is not None and (ed.get("vv") or ed.get("coef")) and d.get("tdb_sha1") and \
+                d["tdb_sha1"] != hashlib.sha1(self.doc.text.encode()).hexdigest():
+            self._log("the TDB file changed since the session was saved: its unsaved edits were not restored")
+            ed = {}
         if self.doc is not None and (ed.get("vv") or ed.get("coef")):
             for r in self.doc.rows:
                 if r.kind == "VV" and r.symbol in ed.get("vv", {}):
@@ -1406,7 +1727,10 @@ class MainWindow(QMainWindow):
         if not self._confirm_discard():
             ev.ignore()
             return
+        # the session reopens next time; edits the user just chose to discard are not carried over
+        self.autosave(keep_edits=False)
         self.runner.shutdown()
+        self.pool.shutdown()
         super().closeEvent(ev)
 
 
@@ -1416,11 +1740,14 @@ def main(argv=None):
     app.setApplicationName("tdb-tweak")
     w = MainWindow()
     w.show()
-    for a in argv[1:]:
+    files = [a for a in argv[1:] if not a.startswith("-")]
+    for a in files:
         if a.endswith(".tdbtweak"):
             w.open_project(a)
         elif a.lower().endswith(".tdb"):
             w.open_tdb(a)
+    if not files and "--fresh" not in argv:
+        w.restore_session()
     return app.exec()
 
 

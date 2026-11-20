@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from typing import List, Optional, Sequence
 
-from PyQt6.QtCore import QAbstractTableModel, QModelIndex, Qt, pyqtSignal
+from PyQt6.QtCore import QAbstractTableModel, QEvent, QModelIndex, QObject, Qt, pyqtSignal
 from PyQt6.QtGui import QBrush, QColor, QFont, QKeySequence, QUndoCommand, QUndoStack
 from PyQt6.QtWidgets import (QAbstractItemView, QCheckBox, QComboBox, QHBoxLayout, QHeaderView, QLabel,
                              QLineEdit, QPushButton, QTableView, QVBoxLayout, QWidget)
@@ -120,10 +120,51 @@ class _EditCommand(QUndoCommand):
         self.panel._apply(self.row, self.old)
 
 
+# step of one Alt+Up/Down nudge per coefficient type: 1/500 of the optimiser floors (about 100 J/mol at 1000 K)
+NUDGE_STEP = {"const": 100.0, "T": 0.1, "TLNT": 0.014, "T2": 1e-4, "T3": 1e-7, "TINV": 1e5}
+
+
+def nudge_step(row: Row) -> float:
+    return NUDGE_STEP.get(row.basis, 0.01)
+
+
+class _NudgeCommand(_EditCommand):
+    """Consecutive nudges of one value merge into a single undo step."""
+
+    def id(self):
+        return 7001
+
+    def mergeWith(self, other):
+        if not isinstance(other, _NudgeCommand):
+            return False
+        same = (other.row.symbol == self.row.symbol) if self.row.kind == "VV" else (other.row.rid == self.row.rid)
+        if not same:
+            return False
+        self.new = other.new
+        self.setText(f"{self.row.symbol if self.row.kind == 'VV' else self.row.meaning()} = {fmt_number(self.new)}")
+        return True
+
+
+class _NudgeFilter(QObject):
+    def __init__(self, panel):
+        super().__init__(panel)
+        self.panel = panel
+
+    def eventFilter(self, obj, ev):
+        if ev.type() == QEvent.Type.KeyPress and ev.key() in (Qt.Key.Key_Up, Qt.Key.Key_Down) and \
+                ev.modifiers() & Qt.KeyboardModifier.AltModifier:
+            sign = 1.0 if ev.key() == Qt.Key.Key_Up else -1.0
+            big = bool(ev.modifiers() & Qt.KeyboardModifier.ShiftModifier)
+            self.panel.nudge(sign * (10.0 if big else 1.0))
+            return True
+        return False
+
+
 class ParamPanel(QWidget):
     """Table + sort/filter controls. Emits ``changed(needs_rebuild)`` after a value changes."""
     changed = pyqtSignal(bool)
     committed = pyqtSignal()
+    nudged = pyqtSignal()
     subsystemRequested = pyqtSignal()
 
     def __init__(self, parent=None):
@@ -153,6 +194,9 @@ class ParamPanel(QWidget):
         self.model = ParamModel(self)
         self.model.valueEdited.connect(self._on_value_edited)
         self.table = QTableView()
+        self.table.installEventFilter(_NudgeFilter(self))
+        self.table.setToolTip("Up/Down: choose a parameter · Alt+Up/Down: change it by one step "
+                              "(a: 100 J/mol, b: 0.1 J/mol/K, …) · Alt+Shift+Up/Down: ten steps")
         self.table.setModel(self.model)
         self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self.table.setEditTriggers(QAbstractItemView.EditTrigger.DoubleClicked
@@ -248,6 +292,19 @@ class ParamPanel(QWidget):
         self.model.refresh_values()
         self.update_count()
         self.changed.emit(rebuild)
+
+    def nudge(self, n_steps: float):
+        """Change the selected value by n steps of its coefficient type (one merged undo step per value)."""
+        if self.doc is None:
+            return
+        idx = self.table.currentIndex()
+        if not idx.isValid():
+            return
+        r = self.model.rows[idx.row()]
+        old = self.doc.value(r)
+        new = float(old + n_steps * nudge_step(r))
+        self.undo_stack.push(_NudgeCommand(self, r, old, new))
+        self.nudged.emit()
 
     def revert_all(self):
         if self.doc is None:

@@ -35,7 +35,17 @@ def _dspin(lo, hi, val, dec, step, suffix=""):
     return s
 
 
+def diagram_tag(e: Dict) -> str:
+    req = e.get("req")
+    els = "-".join(x.capitalize() for x in e.get("elements", []))
+    if req is not None and req.kind == "ternary":
+        return f"{els} {req.temperature:.6g} K"
+    return els
+
+
 def entry_label(e: Dict) -> str:
+    if e["kind"] == "boundary":
+        return f"{e['names'][0]} boundary of {e['names'][0]} + {e['names'][1]}"
     if e["kind"] == "congruent":
         return " = ".join(e["names"]) + "  (congruent)"
     if e["kind"] == "tietriangle":
@@ -62,6 +72,8 @@ def new_entry(item: Dict) -> Dict:
     fixed = set(fixed_phases(e))
     if item["kind"] == "congruent":
         keys = [] if item.get("fixed_x") else [item["names"][0]]
+    elif item["kind"] == "boundary":
+        keys = [item["names"][0]]
     else:
         keys = [k for k in item["cur_x"] if k.split("|")[0] not in fixed]
     e["want_x"] = {k: float(item["cur_x"][k]) for k in keys}
@@ -71,6 +83,8 @@ def new_entry(item: Dict) -> Dict:
 
 
 def key_label(e: Dict, k: str) -> str:
+    if e["kind"] == "boundary":
+        return f"x({k}) at that T"
     if e["kind"] == "congruent":
         return f"x ({' = '.join(e['names'])})"
     if "|" in k:
@@ -219,6 +233,18 @@ class OptPanel(QWidget):
         it.addWidget(self.max_iter)
         it.addWidget(self.reject)
         l2.addLayout(it)
+        hr = QHBoxLayout()
+        self.hold_others = QCheckBox("Hold everything else")
+        self.hold_others.setToolTip("Every other invariant, congruent point and tie triangle of the targets' diagrams "
+                                    "is held where it is (within 5 K / 1 at.%) while the targets move")
+        self.max_total = _dspin(0.1, 1000, 5, 1, 1, " × limit")
+        self.max_total.setToolTip("Over one run, a parameter moves at most this many per-iteration limits from where "
+                                  "it started (stops one parameter from running away when the others barely act)")
+        hr.addWidget(self.hold_others)
+        hr.addStretch(1)
+        hr.addWidget(QLabel("Total change ≤"))
+        hr.addWidget(self.max_total)
+        l2.addLayout(hr)
         lay.addWidget(g2)
 
         # --- run + history ---
@@ -297,7 +323,7 @@ class OptPanel(QWidget):
         for r, (i, f) in enumerate(meta):
             e = entries[i]
             if f == "head":
-                txt = f"{i + 1}.  {entry_label(e)}"
+                txt = f"{i + 1}.  {entry_label(e)}   [{diagram_tag(e)}]"
                 if e["kind"] == "congruent" and e.get("fixed_x"):
                     txt += f"   x fixed by {e['compound']}"
                 elif fixed_phases(e):
@@ -313,7 +339,8 @@ class OptPanel(QWidget):
             use.setFlags(Qt.ItemFlag.ItemIsUserCheckable | Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable)
             on = e["use_T"] if f == "T" else e["use_x"][f]
             use.setCheckState(Qt.CheckState.Checked if on else Qt.CheckState.Unchecked)
-            name = QTableWidgetItem(f"T ({t_unit})" if f == "T" else key_label(e, f))
+            name = QTableWidgetItem((f"at T ({t_unit})" if e["kind"] == "boundary" else f"T ({t_unit})")
+                                    if f == "T" else key_label(e, f))
             name.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable)
             cur = QTableWidgetItem("")
             cur.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable)
@@ -378,14 +405,19 @@ class OptPanel(QWidget):
             if e["kind"] == "tietriangle":
                 els = e["elements"]
                 corners = {n: (cx[f"{n}|{els[1]}"], cx[f"{n}|{els[2]}"]) for n in e["names"]}
-            elif e["kind"] == "invariant":
+            elif e["kind"] in ("invariant", "boundary"):
                 corners = {n: (cx[n],) for n in e["names"]}
+            if e["kind"] == "boundary":
+                T_target = e["want_T"]                      # where the boundary is evaluated (a condition)
+            elif e["kind"] == "tietriangle":
+                T_target = None
+            else:
+                T_target = e["want_T"] if e["use_T"] else None
             out.append(InvariantTarget(
-                tuple(e["names"]), float(e["T"]),
-                T_target=e["want_T"] if (e["use_T"] and e["kind"] != "tietriangle") else None,
+                tuple(e["names"]), float(e["T"]), T_target=T_target,
                 x_target={k: (v if e["use_x"][k] else None) for k, v in e["want_x"].items()},
                 T_tol=self.t_tol.value(), x_tol=self.x_tol.value() / 100, kind=e["kind"],
-                x_guess=float(next(iter(cx.values()))) if cx else 0.5, corners_guess=corners))
+                x_guess=float(next(iter(cx.values()))) if cx else 0.5, corners_guess=corners, req=e.get("req")))
         return out
 
     # ----------------------------------------------------------------------------------------- variables
@@ -489,7 +521,8 @@ class OptPanel(QWidget):
                 floors[b] = DEFAULT_FLOORS[b]
         return OptSettings(max_iter=self.max_iter.value(), rel_limit=self.rel.value() / 100, floors=floors,
                            check_metastable=True, reject_metastable=self.reject.isChecked(),
-                           norm_weight=self.norm_weight(), norm_center=self.norm_center.currentData())
+                           norm_weight=self.norm_weight(), norm_center=self.norm_center.currentData(),
+                           max_total=self.max_total.value(), hold_others=self.hold_others.isChecked())
 
     # ----------------------------------------------------------------------------------------- history
     def clear_history(self):

@@ -14,7 +14,7 @@ from PyQt6.QtWidgets import (QAbstractItemView, QCheckBox, QComboBox, QDialog, Q
                              QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget)
 
 from . import units as U
-from .calibration import CalPoint, Calibration, apply
+from .calibration import CalPoint, Calibration, apply, detect_frame, place_from_frame
 
 KINDS = [("binary", "Binary T–x"), ("ternary", "Ternary isothermal section"), ("isopleth", "Isopleth (T–x)")]
 
@@ -40,6 +40,7 @@ def _f(text: str) -> Optional[float]:
 
 class ImageView(QGraphicsView):
     clicked = pyqtSignal(float, float)
+    dragged = pyqtSignal(int, float, float)        # marker index, new scene position
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -53,6 +54,8 @@ class ImageView(QGraphicsView):
         self._overlay: Optional[QGraphicsPathItem] = None
         self._pan = None
         self._press = None
+        self._marker_pos: List[tuple] = []          # (index, x, y) of placed markers
+        self._dragging: Optional[int] = None
 
     def set_image(self, path: str):
         self.scene().clear()
@@ -72,10 +75,20 @@ class ImageView(QGraphicsView):
             self.setCursor(Qt.CursorShape.ClosedHandCursor)
             return
         if ev.button() == Qt.MouseButton.LeftButton:
+            for i, x, y in self._marker_pos:
+                p = self.mapFromScene(QPointF(x, y))
+                if (QPointF(p) - ev.position()).manhattanLength() <= 12:
+                    self._dragging = i
+                    self.setCursor(Qt.CursorShape.SizeAllCursor)
+                    return
             self._press = ev.position()
         super().mousePressEvent(ev)
 
     def mouseMoveEvent(self, ev):
+        if self._dragging is not None:
+            p = self.mapToScene(ev.position().toPoint())
+            self.dragged.emit(self._dragging, p.x(), p.y())
+            return
         if self._pan is not None:
             d = ev.position() - self._pan
             self._pan = ev.position()
@@ -85,6 +98,10 @@ class ImageView(QGraphicsView):
         super().mouseMoveEvent(ev)
 
     def mouseReleaseEvent(self, ev):
+        if self._dragging is not None:
+            self._dragging = None
+            self.unsetCursor()
+            return
         if self._pan is not None:
             self._pan = None
             self.unsetCursor()
@@ -97,11 +114,12 @@ class ImageView(QGraphicsView):
         super().mouseReleaseEvent(ev)
 
     def set_markers(self, pts: Sequence[tuple]):
-        """pts: (x, y, label, selected)."""
+        """pts: (x, y, label, selected[, index])."""
         for m in self._markers:
             self.scene().removeItem(m)
         self._markers = []
-        for x, y, label, sel in pts:
+        self._marker_pos = [(p[4], p[0], p[1]) for p in pts if len(p) > 4]
+        for x, y, label, sel, *_ in pts:
             col = QColor(230, 30, 30) if sel else QColor(20, 90, 230)
             pen = QPen(col, 2)
             pen.setCosmetic(True)
@@ -167,6 +185,7 @@ class CalibrationDialog(QDialog):
         self.view = ImageView()
         self.view.set_image(image_path)
         self.view.clicked.connect(self._on_click)
+        self.view.dragged.connect(self._on_drag)
 
         # --- form ---
         self.kind = QComboBox()
@@ -194,6 +213,9 @@ class CalibrationDialog(QDialog):
         self.add_pt = QPushButton("Add point")
         self.del_pt = QPushButton("Remove point")
         self.from_bounds = QPushButton("Values from bounds")
+        self.detect_btn = QPushButton("Detect frame")
+        self.detect_btn.setToolTip("Find the plot frame and put the axis points on its corners, with the axis bounds "
+                                   "as their values (binary / isopleth); adjust what is off")
         self.info = QLabel()
         self.info.setWordWrap(True)
 
@@ -232,6 +254,7 @@ class CalibrationDialog(QDialog):
         btns.addWidget(self.add_pt)
         btns.addWidget(self.del_pt)
         btns.addWidget(self.from_bounds)
+        btns.addWidget(self.detect_btn)
         self.bb = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
         self.bb.accepted.connect(self._accept)
         self.bb.rejected.connect(self.reject)
@@ -265,7 +288,30 @@ class CalibrationDialog(QDialog):
         self.add_pt.clicked.connect(self._add_point)
         self.del_pt.clicked.connect(self._del_point)
         self.from_bounds.clicked.connect(self._values_from_bounds)
+        self.detect_btn.clicked.connect(lambda: self._detect(verbose=True))
         self._refresh()
+        if self.cal.kind != "ternary" and not any(p.placed for p in self.cal.points):
+            self._detect(verbose=False)
+
+    def _detect(self, verbose: bool):
+        self._read_form()
+        if self.cal.kind == "ternary":
+            self.info.setText("Frame detection works for binary and isopleth images; place the ternary points by hand.")
+            return
+        try:
+            corners = detect_frame(load_rgba(self.cal.image_path))
+        except Exception as ex:
+            if verbose:
+                self.info.setText(f"<span style='color:#a00'>Frame not found: {ex}</span>")
+            return
+        place_from_frame(self.cal, corners)
+        self._building = True
+        self.mode.setCurrentIndex(0)
+        self._building = False
+        self._update_labels()
+        self._refresh()
+        self.info.setText(self.info.text() + "  Frame detected: the points sit on its corners with the axis bounds "
+                                             "as values — check the bounds, and drag any point that is off.")
 
     # -- form <-> calibration -----------------------------------------------------------------------------
     def _load_into_form(self):
@@ -392,7 +438,7 @@ class CalibrationDialog(QDialog):
             self._selected = min(self._selected, len(pts) - 1)
             self.table.selectRow(self._selected)
         self._building = False
-        self.view.set_markers([(p.px, p.py, self._point_name(i, p), i == self._selected)
+        self.view.set_markers([(p.px, p.py, self._point_name(i, p), i == self._selected, i)
                                for i, p in enumerate(pts) if p.placed])
         self._update_overlay()
 
@@ -413,7 +459,7 @@ class CalibrationDialog(QDialog):
         rows = self.table.selectionModel().selectedRows()
         if rows:
             self._selected = rows[0].row()
-            self.view.set_markers([(p.px, p.py, self._point_name(i, p), i == self._selected)
+            self.view.set_markers([(p.px, p.py, self._point_name(i, p), i == self._selected, i)
                                    for i, p in enumerate(self.cal.points) if p.placed])
 
     def _on_click(self, x: float, y: float):
@@ -425,6 +471,13 @@ class CalibrationDialog(QDialog):
         nxt = [i for i in unplaced if i > self._selected] or unplaced
         if nxt:
             self._selected = nxt[0]
+        self._refresh()
+
+    def _on_drag(self, i: int, x: float, y: float):
+        if not (0 <= i < len(self.cal.points)):
+            return
+        self.cal.points[i].px, self.cal.points[i].py = x, y
+        self._selected = i
         self._refresh()
 
     def _add_point(self):

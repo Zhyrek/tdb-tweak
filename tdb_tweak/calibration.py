@@ -259,3 +259,94 @@ class Calibration:
         inside = (px >= 0) & (px <= w_img - 1) & (py >= 0) & (py <= h_img - 1)
         out[..., 3] *= inside
         return out, (x0, x1, y0, y1)
+
+
+# ---------------------------------------------------------------------------------------------------------
+# frame detection (pre-placing the calibration points)
+# ---------------------------------------------------------------------------------------------------------
+def _dark_mask(rgba: np.ndarray) -> np.ndarray:
+    img = rgba.astype(np.float32)
+    if img.max() > 1.0:
+        img = img / 255.0
+    gray = img[..., :3].mean(axis=2)
+    if img.shape[2] == 4:
+        gray = gray * img[..., 3] + (1.0 - img[..., 3])          # transparent = paper
+    bg, ink = float(np.median(gray)), float(np.percentile(gray, 0.5))
+    return gray < ink + 0.5 * (bg - ink)
+
+
+def _strongest_lines(xs, ys, angles_deg, horizontal: bool, min_count: float):
+    """Best rotation and the positions of long straight lines at it (projection histogram peaks)."""
+    best = None
+    for a in angles_deg:
+        t = np.deg2rad(a)
+        # horizontal lines: constant y' = y cos t - x sin t; vertical: constant x' = x cos t + y sin t
+        proj = ys * np.cos(t) - xs * np.sin(t) if horizontal else xs * np.cos(t) + ys * np.sin(t)
+        lo = np.floor(proj.min())
+        h = np.bincount((proj - lo).astype(int))
+        score = h.max()
+        if best is None or score > best[0]:
+            best = (score, a, h, lo)
+    _, a, h, lo = best
+    peaks = [i for i in range(len(h)) if h[i] >= min_count and h[i] == h[max(0, i - 3):i + 4].max()]
+    return a, [p + lo + 0.5 for p in peaks]
+
+
+def _fit_line(xs, ys, a_deg, pos, horizontal: bool):
+    """Least-squares line through the dark pixels within 2 px of a detected line: returns (point, direction)."""
+    t = np.deg2rad(a_deg)
+    proj = ys * np.cos(t) - xs * np.sin(t) if horizontal else xs * np.cos(t) + ys * np.sin(t)
+    sel = np.abs(proj - pos) <= 2.0
+    X, Y = xs[sel].astype(float), ys[sel].astype(float)
+    if horizontal:
+        k, b = np.polyfit(X, Y, 1)
+        return np.array([0.0, b]), np.array([1.0, k]) / np.hypot(1.0, k)
+    k, b = np.polyfit(Y, X, 1)
+    return np.array([b, 0.0]), np.array([k, 1.0]) / np.hypot(1.0, k)
+
+
+def _intersect(p1, d1, p2, d2):
+    A = np.array([d1, -d2]).T
+    s = np.linalg.solve(A, p2 - p1)
+    return p1 + s[0] * d1
+
+
+def detect_frame(rgba: np.ndarray, max_deg: float = 6.0) -> dict:
+    """Corners of the plot frame (pixels): bottom-left, bottom-right, top-left, top-right.
+
+    Works with a slightly rotated or sheared image: horizontal and vertical frame lines get their own angles."""
+    dark = _dark_mask(rgba)
+    H, W = dark.shape
+    ys, xs = np.nonzero(dark)
+    if len(xs) < 50:
+        raise ValueError("the image has almost no dark pixels")
+    angles = np.arange(-max_deg, max_deg + 1e-9, 0.1)
+    ah, hpos = _strongest_lines(xs, ys, angles, True, 0.3 * W)
+    av, vpos = _strongest_lines(xs, ys, angles, False, 0.3 * H)
+    if not hpos or not vpos:
+        raise ValueError("no long straight frame lines found")
+    bottom, top = max(hpos), min(hpos)
+    left, right = min(vpos), max(vpos)
+    lines = {}
+    for name, pos, horiz, a in (("bottom", bottom, True, ah), ("top", top, True, ah),
+                                ("left", left, False, av), ("right", right, False, av)):
+        lines[name] = _fit_line(xs, ys, a, pos, horiz)
+    corners = {
+        "bottom_left": _intersect(*lines["bottom"], *lines["left"]),
+        "bottom_right": _intersect(*lines["bottom"], *lines["right"]),
+        "top_left": _intersect(*lines["top"], *lines["left"]),
+        "top_right": _intersect(*lines["top"], *lines["right"]),
+    }
+    bl, br, tl = corners["bottom_left"], corners["bottom_right"], corners["top_left"]
+    if np.linalg.norm(br - bl) < 0.2 * W or np.linalg.norm(tl - bl) < 0.2 * H:
+        raise ValueError("the detected frame is implausibly small")
+    return {k: (float(v[0]), float(v[1])) for k, v in corners.items()}
+
+
+def place_from_frame(cal: "Calibration", corners: dict) -> None:
+    """Axis-points calibration with the frame corners at the axis bounds (binary / isopleth)."""
+    xmin, xmax, tmin, tmax = cal.bounds
+    bl, br, tl = corners["bottom_left"], corners["bottom_right"], corners["top_left"]
+    cal.mode = "axes"
+    cal.points = [CalPoint(*bl, a=xmin, role="x1"), CalPoint(*br, a=xmax, role="x2"),
+                  CalPoint(*bl, b=tmin, role="y1"), CalPoint(*tl, b=tmax, role="y2")]

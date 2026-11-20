@@ -191,12 +191,29 @@ def draw_images(ax, images: Sequence[Tuple[np.ndarray, Tuple[float, float, float
                   interpolation="bilinear")
 
 
+def draw_ghost(ax, view: View, res: Optional[MapResult]):
+    """The map of the checkpoint parameters, faint and grey, behind the current one."""
+    if res is None:
+        return
+    for b in res.boundaries:
+        if len(b.x):
+            X, Y = to_plot(view, b.x, b.y)
+            ax.plot(X, Y, color="#9a9a9a", lw=3.2, alpha=0.45, zorder=1.5, solid_capstyle="round")
+    for names, xs, ys in res.invariants:
+        X, Y = to_plot(view, xs, ys)
+        if view.kind == "binary":
+            ax.plot([np.min(X), np.max(X)], [np.mean(Y)] * 2, color="#9a9a9a", lw=3.0, alpha=0.45, zorder=1.5)
+        elif view.kind == "ternary":
+            ax.plot(np.r_[X, X[:1]], np.r_[Y, Y[:1]], color="#9a9a9a", lw=2.0, alpha=0.45, zorder=1.5)
+
+
 def draw_all(fig, view: View, res: Optional[MapResult], datasets: Sequence[ZPFDataset],
-             images: Sequence, colors: PhaseColors, limits: Optional[Tuple] = None):
+             images: Sequence, colors: PhaseColors, limits: Optional[Tuple] = None, ghost: Optional[MapResult] = None):
     """Clear ``fig`` and draw everything. Returns (ax, pickable zpf artists)."""
     fig.clear()
     ax = fig.add_subplot(111)
     draw_images(ax, images)
+    draw_ghost(ax, view, ghost)
     handles = draw_result(ax, view, res, colors)
     zpf_artists = draw_zpf(ax, view, datasets, colors)
     if view.kind == "ternary":

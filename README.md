@@ -28,6 +28,14 @@ Run the tests with `.venv/bin/python -m pytest`.
     Parameters with several temperature ranges show the range.
   * **Editing.** Double-click a value or start typing, then press Enter. Ctrl+Z / Ctrl+Shift+Z undo and redo.
     Changed values are bold.
+  * **Keyboard tweaking.** ↑/↓ moves between parameters. Alt+↑/↓ changes the selected value by one step: 100 J/mol
+    for a, 0.1 J/mol/K for b, and the equivalent for c–f. Alt+Shift+↑/↓ changes it by ten steps. Consecutive nudges of
+    one value are a single undo step. The diagram redraws about 0.35 s after the last key, using a fast (warm-start)
+    map.
+  * **Checkpoint and ghost.** Edit ▸ Save Checkpoint (Ctrl+K) records the current parameters. The diagram of the
+    checkpoint is drawn faintly in grey behind the current one, so you can see what your changes moved. When a file
+    is opened, the checkpoint is its own values. Ctrl+Shift+K reverts to the checkpoint and Ctrl+G shows or hides
+    the ghost. With ZPF data loaded, the status line also shows the checkpoint's ZPF score.
   * **Shared VV symbols.** A VV symbol used in several places gets one row per use, and editing any of them edits
     all of them. A parameter with two VV terms has two rows.
   * **Sorting.** By VV number; by phase → term (G, L0, L1, …, TC, BMAGN) → a, b, c…; or by phase → constituents →
@@ -40,6 +48,18 @@ Run the tests with `.venv/bin/python -m pytest`.
 * **Diagram (centre).** The diagram types are binary T–x, ternary isothermal section and isopleth (constant x(C)).
   * **Redraw** (F5 or Ctrl+R) maps again. The mapping runs in the background, lines appear as they are traced, and
     Esc cancels. "Redraw on commit" maps again after every Enter in the table.
+  * **Fast redraws.** Redraws after nudges and commits start from the previous map's starting points instead of
+    searching the axis edges again: about 40 % faster on Cu-Mg and 55 % on the Al-Cr-Ni section. The status line marks
+    them "(fast)". A brand-new phase region that touches none of the old starting points could be missed, so F5
+    always maps in full.
+  * **Right-click ▸ Equilibrium here** computes the equilibrium at that point with the current parameters and shows
+    the phases, their fractions and compositions.
+  * **Diagram ▸ Check for Artifacts** scans the current system for typical CALPHAD breakages:
+    * a solid stable at 4000–6000 K;
+    * a liquid miscibility gap at those temperatures;
+    * a phase that on its own has a miscibility gap at 3000 or 5000 K (an inverted gap);
+    * the liquid stable at 300 K, reported as a note.
+    The scan also runs automatically after every optimization.
   * **Global-min pdens** is the sampling density of mapping's global-minimum check, which takes most of the mapping
     time. Lowering it is faster but can miss phases.
   * **Solver** switches between pycalphad's solver and column generation.
@@ -68,6 +88,9 @@ Run the tests with `.venv/bin/python -m pytest`.
       give a homography.
     * Partial triangles and composition windows work.
     * A magenta grid drawn back onto the image shows whether the calibration fits.
+    * **Frame detection:** for binary and isopleth images, the plot frame is found automatically, even when the
+      image is slightly rotated or sheared. The four axis points are placed on its corners, with the axis bounds as
+      their values, so you only check them. Markers can be dragged, and "Detect frame" runs the detection again.
     * Calibrations are saved next to the image as `*.tdbtweak.json` and in the project.
     * Checking an image switches the diagram to its type, elements and units. **Fit ranges to image** maps only the
       window the image shows, which is faster.
@@ -75,6 +98,13 @@ Run the tests with `.venv/bin/python -m pytest`.
     * For ternaries, only tie-lines within ±5 K of the section are shown; the tolerance is adjustable.
     * The list of temperatures found in the data maps that section on double-click. Clicking a data point shows its
       reference and enables "Map section at picked point's T".
+    * **ZPF score:** after each map, the status line shows how far the data are from equilibrium with the current
+      parameters, e.g. "ZPF 699 J/mol (530 pts)". This follows ESPEI's approach:
+      * the target hyperplane is the mean chemical potential of the single-phase equilibria at a tie-line's measured
+        vertices;
+      * each vertex's driving force is its phase's distance from that hyperplane;
+      * the score is the RMS in J/mol, where 0 is a perfect fit.
+      Each dataset in the list shows its own score, and the status-line tooltip lists the worst points.
 * **Optimize (binary invariants and congruent points, ternary tie triangles).** Moves a three-phase invariant (eutectic, peritectic, …)
   to a target temperature and/or target compositions of its three phases, or a congruent point (congruent melting
   or a congruent solid-state transformation) to a target temperature and composition, by adjusting the parameters
@@ -138,12 +168,31 @@ Run the tests with `.venv/bin/python -m pytest`.
     history lets you apply any earlier iteration instead, e.g. "a few steps in that direction", or revert to the
     start. Ctrl+Z works too. The change table shows each parameter's start value, value and Δ/limit; red means
     the parameter hit its limit.
+  * **Boundary nodes:** right-click a phase boundary line of a binary ▸ "Add boundary node", then drag the node. The
+    target is that boundary passing through the node: at the node's temperature, the phase's boundary composition
+    is solved as a two-phase equilibrium and compared with the node's x.
+  * **Targets across views:** each target belongs to the diagram it was added on, which is shown in the target
+    list. One run can mix targets from binary diagrams and from ternary sections at different temperatures. Run it
+    from any diagram; "Map all views" refreshes the others afterwards.
+  * **Hold everything else:** one tick box. Every other invariant, congruent point and tie triangle of the targets'
+    diagrams is then held where it is, within 5 K / 1 at.%. In the Cu-Mg test, moving the Laves maximum by 26 K moved
+    nothing else by more than about 2 K; without the hold, other features moved 130–180 K.
+  * **Runaway guard:**
+    * **total-change cap:** over one run, a parameter moves at most N× its per-iteration limit, 5 by default;
+    * **dominance note:** when one parameter carries more than 80 % of a step, the history says so, because the
+      other parameters barely affect the targets and that one is being pushed hard.
   * **Side effects:** only the targets are constrained. Other features (e.g. a neighbouring eutectic) can still move,
-    so add the ones that matter as held targets, and vary only the parameters of the phases taking part.
+    so add the ones that matter as held targets or use "Hold everything else", and vary only the parameters of the
+    phases taking part.
 * **Files.**
   * **Save TDB** writes only the numbers that changed; the rest of the file stays byte-identical.
   * **Projects** (`*.tdbtweak`) store the TDB path, subsystem, diagram settings, image calibrations, ZPF files and
     any unsaved edits.
+  * **Last session:** every minute and on quitting, the session is saved and reopened at the next start (start with
+    `--fresh` to skip that). Unsaved edits are kept by the periodic save, as crash recovery, but not when you quit
+    with "Discard". They are restored only if the TDB file is unchanged.
+  * **Save as Next Version** (Ctrl+Alt+V) writes `name_v2.tdb`, then `_v3`, and so on. **Show Changes…** (Ctrl+D)
+    is a line diff of your edits against the file as opened or last saved.
 
 ## Why redraws are fast
 
@@ -168,6 +217,11 @@ Measured on an M-series Mac, pycalphad 0.12.0:
 | Cu-Mg binary, column generation | ~0.5 s |
 | Al-Cr-Ni 1273 K section, 2 % steps | ~3 s |
 | Al-Cr-Ni isopleth, x(Cr) = 0.1 | ~14 s (pycalphad's isopleth strategy) |
+| Fast redraw (warm start) after a nudge: Cu-Mg / Al-Cr-Ni section | ~0.5 s / ~1.4 s |
+| "Map all views", 4 Cu-Mg views / 3 Al-Cr-Ni sections (process pool, warm) | 1.2 s / 3.2 s (sequential: 2.9 s / 8.4 s) |
+
+"Map all views" uses a pool of worker processes. It is started in the background once two views are saved, and its
+first run includes process start-up.
 
 ## Caveats
 
@@ -175,6 +229,15 @@ Measured on an M-series Mac, pycalphad 0.12.0:
   coefficient by 1e-6 J/mol changes the number of lines (14 ↔ 16) and drops a B2+B2+L1₂ invariant. If a feature
   appears or vanishes after a small edit, nudge the value or the step size before trusting it.
 * The engine relies on pycalphad 0.12 internals (`pycalphad>=0.12,<0.13` is pinned).
+
+## Later ideas
+
+* **Map cross-check:** re-check a finished map with point equilibria (or the column-generation solver) on a coarse
+  grid and mark lines where they disagree. This would matter if pycalphad's mapping fragility turns out to be a
+  frequent problem.
+* **Literature points by hand + automatic classification:** you mark points on an image, and a model classifies
+  them (liquidus, solvus, invariant, which phases) and proposes corrections. This would be an alternative to
+  automatic digitizing, which is fragile on real figures. They could then become targets or ESPEI ZPF datasets.
 
 ## Tests
 

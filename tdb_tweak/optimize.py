@@ -60,9 +60,11 @@ class InvariantTarget:
     x_target: Dict[str, Optional[float]] = field(default_factory=dict)   # phase -> x(B) target (mole fraction)
     T_tol: float = 1.0                       # K
     x_tol: float = 0.001                     # mole fraction
-    kind: str = "invariant"                  # "invariant", "congruent" (binary) or "tietriangle" (ternary section)
+    kind: str = "invariant"                  # "invariant", "congruent", "boundary" (binary), "tietriangle" (ternary)
     x_guess: float = 0.5                     # congruent: composition of the point to optimise
-    corners_guess: Dict[str, Tuple[float, float]] = field(default_factory=dict)   # tietriangle: phase -> (xB, xC)
+    corners_guess: Dict[str, Tuple[float, ...]] = field(default_factory=dict)   # phase -> current composition
+    req: Optional[MapRequest] = None         # the diagram this target belongs to (None: the run's request)
+    hold: bool = False                       # added automatically to hold a feature in place
 
 
 @dataclass
@@ -76,6 +78,10 @@ class OptSettings:
     global_min_pdens: int = 500
     norm_weight: float = 0.0                 # optional penalty weight * sum((p - centre) / floor)^2; 0 = off
     norm_center: str = "zero"                # "zero" (small parameters) or "start" (stay near the start values)
+    max_total: float = 5.0                   # a parameter moves at most this many per-iteration limits per run
+    hold_others: bool = False                # hold every other feature of the targets' diagrams in place
+    hold_T_tol: float = 5.0                  # K
+    hold_x_tol: float = 0.01                 # mole fraction
 
 
 @dataclass
@@ -106,6 +112,8 @@ class OptResult:
     seconds: float
     targets: List[InvariantTarget]
     variables: List[Variable]
+    holds: List[InvariantTarget] = field(default_factory=list)
+    artifacts: List = field(default_factory=list)          # artifacts.Finding after the run
 
     @property
     def target(self) -> InvariantTarget:
@@ -204,9 +212,11 @@ class _CongruentPoint:
 
 
 def _residuals(T, x, tgt: InvariantTarget) -> np.ndarray:
-    """x and tgt.x_target share keys: a phase name (binary) or "PHASE|EL" (a ternary corner's x(EL))."""
+    """x and tgt.x_target share keys: a phase name (binary) or "PHASE|EL" (a ternary corner's x(EL)).
+
+    A boundary node's T is where its composition is evaluated, not a residual."""
     r = []
-    if tgt.T_target is not None:
+    if tgt.T_target is not None and tgt.kind != "boundary":
         r.append((T - tgt.T_target) / tgt.T_tol)
     for k, xt in tgt.x_target.items():
         if xt is not None:
@@ -329,107 +339,236 @@ def find_invariant_node(strategy, phases: Sequence[str], T_guess: float):
     return best
 
 
+class _Boundary:
+    """A binary two-phase equilibrium at fixed T: the boundary composition of each phase there."""
+
+    def __init__(self, node, B_index: int, B: str, T: float):
+        self.names = list(node.stable_phases_with_multiplicity)
+        self.css0 = copy.deepcopy(node.stable_composition_sets)
+        self.css = copy.deepcopy(self.css0)
+        self.iB, self.B, self.T = B_index, B, float(T)
+
+    def solve(self, start=None):
+        css = copy.deepcopy(start if start is not None else self.css)
+        xb = [float(np.asarray(c.X)[self.iB]) for c in css]
+        for c in css:
+            c.fixed = False
+            map_utils.update_cs_phase_frac(c, 0.5)
+        conds = {v.P: np.array(101325.0), v.N: np.array(1.0), v.T: np.array(self.T),
+                 v.X(self.B): np.array([0.5 * (xb[0] + xb[1])])}
+        try:
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                res = Solver(remove_metastable=False).solve(css, conds)
+        except Exception:
+            return None
+        if not res.converged or any(float(c.NP) < -1e-6 for c in css):
+            return None
+        x = {n: float(np.asarray(c.X)[self.iB]) for n, c in zip(self.names, css)}
+        if abs(x[self.names[0]] - x[self.names[1]]) < 1e-6:
+            return None                          # collapsed to one phase: no boundary at this T
+        return self.T, x, css, conds, np.array(res.chemical_potentials)
+
+    def solve_robust(self):
+        out = self.solve()
+        if out is None:
+            out = self.solve(self.css0)
+        return out
+
+    def accept(self, out):
+        self.css = out[2]
+
+
+def _features(strategy, rq: MapRequest, models) -> List[InvariantTarget]:
+    """Every invariant / congruent point (binary) or tie triangle (ternary) of a map, at its current values."""
+    from .points import composition_space, detect_congruent
+    els = list(rq.elements)
+    rank = {}
+
+    def free(name):
+        b = name.split("#")[0]
+        if b not in rank:
+            try:
+                rank[b] = composition_space(models[b], els[1:])["rank"]
+            except Exception:
+                rank[b] = 2
+        return rank[b] > 0
+
+    out = []
+    srt = sorted(els)
+    for node in strategy.node_queue.nodes:
+        if len(node.stable_composition_sets) != 3:
+            continue
+        names = list(node.stable_phases_with_multiplicity)
+        Xs = [np.asarray(c.X) for c in node.stable_composition_sets]
+        if rq.kind == "binary":
+            iB = srt.index(els[1])
+            x = {n: float(X[iB]) for n, X in zip(names, Xs)}
+            T = float(np.squeeze(node.global_conditions[v.T]))
+            out.append(InvariantTarget(tuple(names), T, T_target=T, x_target={n: x[n] for n in names if free(n)},
+                                       corners_guess={n: (x[n],) for n in names}, req=rq))
+        elif rq.kind == "ternary":
+            iB, iC = srt.index(els[1]), srt.index(els[2])
+            xt, cg = {}, {}
+            for n, X in zip(names, Xs):
+                cg[n] = (float(X[iB]), float(X[iC]))
+                if free(n):
+                    xt[f"{n}|{els[1]}"], xt[f"{n}|{els[2]}"] = cg[n]
+            out.append(InvariantTarget(tuple(names), rq.temperature, x_target=xt, kind="tietriangle",
+                                       corners_guess=cg, req=rq))
+    if rq.kind == "binary":
+        for c in detect_congruent(strategy, els[0], els[1], models):
+            out.append(InvariantTarget(tuple(c.phases), c.T, T_target=c.T,
+                                       x_target={} if c.fixed_x else {c.phases[0]: c.x}, kind="congruent",
+                                       x_guess=c.x, req=rq))
+    return out
+
+
+def _same_feature(a: InvariantTarget, b: InvariantTarget) -> bool:
+    if a.kind != b.kind or sorted(a.phases) != sorted(b.phases):
+        return False
+    if a.kind == "tietriangle":
+        return sum(abs(a.corners_guess[n][k] - b.corners_guess.get(n, (9, 9))[k])
+                   for n in a.corners_guess for k in range(2)) < 0.05
+    return abs(a.T_guess - b.T_guess) < 5.0
+
+
 def optimize_invariant(engine: Engine, req: MapRequest, values: Dict[str, float], variables: Sequence[Variable],
                        targets, settings: OptSettings, cancel: Optional[threading.Event] = None,
                        progress: Optional[Callable[[OptIteration], None]] = None) -> OptResult:
-    """Move one or several binary invariants / congruent points to their targets at the same time.
+    """Move binary invariants, congruent points and boundary nodes, and ternary tie triangles to their targets.
 
-    ``targets`` is an InvariantTarget or a list of them.  A target whose wanted values equal its current ones holds
-    that point in place while the others move."""
+    ``targets`` is an InvariantTarget or a list of them; each may belong to its own diagram (``target.req``, e.g.
+    from a saved view), else to ``req``.  A target whose wanted values equal its current ones holds that feature in
+    place; with ``settings.hold_others`` every other feature of the targets' diagrams is held too (looser
+    tolerances)."""
     t0 = time.perf_counter()
     targets = [targets] if isinstance(targets, InvariantTarget) else list(targets)
-    if req.kind not in ("binary", "ternary"):
-        raise ValueError("optimisation works on binary diagrams and ternary isothermal sections")
-    if req.kind == "ternary" and any(t.kind != "tietriangle" for t in targets):
-        raise ValueError("on a ternary section, the targets are tie triangles")
-    if req.kind == "binary" and any(t.kind == "tietriangle" for t in targets):
-        raise ValueError("tie triangles are targets of ternary isothermal sections")
     if not variables:
         raise ValueError("choose at least one parameter to vary")
     if not targets:
         raise ValueError("add at least one target")
     for t in targets:
+        if t.req is None:
+            t.req = req
         if t.T_target is None and not any(xv is not None for xv in t.x_target.values()):
             raise ValueError(f"{target_label(t)}: tick at least one target value (temperature or a composition)")
-    A, B = req.elements[0], req.elements[1]
+        if (t.kind == "tietriangle") != (t.req.kind == "ternary") or t.req.kind not in ("binary", "ternary"):
+            raise ValueError(f"{target_label(t)}: tie triangles belong to ternary sections, the others to binaries")
     values = dict(values)
     names = [var.name for var in variables]
     missing = [n for n in names if n not in values]
     if missing:
         raise ValueError(f"not parameters of the compute database: {missing}")
 
-    # locate every point on a map with the current values
-    engine.run(req, values, cancel=cancel)
-    strategy = engine.last_strategy
-    comps = tuple(sorted(set(req.elements) | {"VA"}))
-    phases = tuple(sorted(req.phases)) if req.phases else tuple(engine.phases_for(list(req.elements)))
-    models, prf = engine._models(comps, phases, values)
-    solvers = []
+    # one map per diagram to locate the features
+    from .views import request_key
+    contexts = {}
     for t in targets:
-        if t.kind == "tietriangle":
-            node = find_triangle_node(strategy, t.phases, req.elements, t.corners_guess)
-            if node is None and t.corners_guess:
-                node = states_from_compositions(engine, comps, models, prf, t.phases, t.corners_guess,
-                                                req.elements[1:], req.temperature)
-            if node is None:
-                raise ValueError(f"the tie triangle {target_label(t)} is not on the current section")
-            solvers.append(_TieTriangle(node, req.elements, req.temperature))
-        elif t.kind == "congruent":
-            cands = [c for c in find_congruent_candidates(strategy, B) if sorted(c[0]) == sorted(t.phases)]
-            if not cands:
-                raise ValueError(f"the congruent point {target_label(t)} is not on the current map")
-            cand = min(cands, key=lambda c: abs(c[3] - t.T_guess) / 100 + abs(c[2] - t.x_guess))
-            got = solve_congruent_from_line(*cand, A, B, models)
-            if got is None:
-                raise ValueError(f"could not solve the congruent point {target_label(t)} at the current values")
-            solvers.append(_CongruentPoint(got[0], got[1][1], got[1][0], B))
-        else:
-            node = find_invariant_node(strategy, t.phases, t.T_guess)
-            if node is not None and abs(float(np.squeeze(node.global_conditions[v.T])) - t.T_guess) > 20:
-                node = None
-            if node is None and t.corners_guess:
-                node = states_from_compositions(engine, comps, models, prf, t.phases, t.corners_guess, [B], t.T_guess)
-            if node is None:
-                raise ValueError(f"the invariant {target_label(t)} is not on the current map")
-            solvers.append(_Invariant(node, sorted([A, B]).index(B), B))
-    system_info = strategy.system_info
+        k = request_key(t.req)
+        if k not in contexts:
+            if cancel is not None and cancel.is_set():
+                raise Cancelled()
+            rq = t.req
+            engine.run(rq, values, cancel=cancel)
+            comps = tuple(sorted(set(rq.elements) | {"VA"}))
+            phases = tuple(sorted(rq.phases)) if rq.phases else tuple(engine.phases_for(list(rq.elements)))
+            models, prf = engine._models(comps, phases, values)
+            contexts[k] = dict(req=rq, strategy=engine.last_strategy, comps=comps, models=models, prf=prf)
+    prfs = list({id(c["prf"]): c["prf"] for c in contexts.values()}.values())
 
     def set_values(vals):
-        prf.update_parameters({k: float(vals[k]) for k in engine.param_names})
+        upd = {k: float(vals[k]) for k in engine.param_names}
+        for f in prfs:
+            f.update_parameters(upd)
+
+    def make_solver(t: InvariantTarget):
+        ctx = contexts[request_key(t.req)]
+        rq, strategy, comps, models, prf = ctx["req"], ctx["strategy"], ctx["comps"], ctx["models"], ctx["prf"]
+        A, B = rq.elements[0], rq.elements[1]
+        if t.kind == "tietriangle":
+            node = find_triangle_node(strategy, t.phases, rq.elements, t.corners_guess)
+            if node is None and t.corners_guess:
+                node = states_from_compositions(engine, comps, models, prf, t.phases, t.corners_guess,
+                                                rq.elements[1:], rq.temperature)
+            return None if node is None else _TieTriangle(node, rq.elements, rq.temperature)
+        if t.kind == "congruent":
+            cands = [c for c in find_congruent_candidates(strategy, B) if sorted(c[0]) == sorted(t.phases)]
+            if not cands:
+                return None
+            cand = min(cands, key=lambda c: abs(c[3] - t.T_guess) / 100 + abs(c[2] - t.x_guess))
+            got = solve_congruent_from_line(*cand, A, B, models)
+            return None if got is None else _CongruentPoint(got[0], got[1][1], got[1][0], B)
+        if t.kind == "boundary":
+            node = states_from_compositions(engine, comps, models, prf, t.phases, t.corners_guess, [B], t.T_target)
+            return _Boundary(node, sorted([A, B]).index(B), B, t.T_target)
+        node = find_invariant_node(strategy, t.phases, t.T_guess)
+        if node is not None and abs(float(np.squeeze(node.global_conditions[v.T])) - t.T_guess) > 20:
+            node = None
+        if node is None and t.corners_guess:
+            node = states_from_compositions(engine, comps, models, prf, t.phases, t.corners_guess, [B], t.T_guess)
+        return None if node is None else _Invariant(node, sorted([A, B]).index(B), B)
+
+    solvers = []
+    for t in targets:
+        s_ = make_solver(t)
+        if s_ is None:
+            raise ValueError(f"{target_label(t)} is not on its diagram at the current values")
+        solvers.append(s_)
+
+    # every other feature, held in place (looser tolerances)
+    holds = []
+    if settings.hold_others:
+        for ctx in contexts.values():
+            for f in _features(ctx["strategy"], ctx["req"], ctx["models"]):
+                if any(_same_feature(f, t) for t in targets if request_key(t.req) == request_key(ctx["req"])):
+                    continue
+                if f.T_target is None and not f.x_target:
+                    continue
+                f.hold = True
+                f.T_tol, f.x_tol = settings.hold_T_tol, settings.hold_x_tol
+                s_ = make_solver(f)
+                if s_ is not None:
+                    set_values(values)
+                    if s_.solve_robust() is not None:
+                        holds.append(f)
+                        solvers.append(s_)
+    all_targets = targets + holds
 
     def evaluate(vals, robust=False):
         set_values(vals)
         outs = []
-        for s in solvers:
-            o = s.solve_robust() if robust else s.solve()
+        for s_ in solvers:
+            o = s_.solve_robust() if robust else s_.solve()
             if o is None and not robust:
-                o = s.solve_robust()
+                o = s_.solve_robust()
             if o is None:
                 return None
             outs.append(o)
         return outs
 
     def residuals(outs):
-        return np.concatenate([_residuals(o[0], o[1], t) for o, t in zip(outs, targets)])
+        return np.concatenate([_residuals(o[0], o[1], t) for o, t in zip(outs, all_targets)])
 
     def accept(outs):
-        for s, o in zip(solvers, outs):
-            s.accept(o)
+        for s_, o in zip(solvers, outs):
+            s_.accept(o)
 
     def pts(outs):
-        return [(float(o[0]), dict(o[1])) for o in outs]
+        return [(float(o[0]), dict(o[1])) for o in outs[:len(targets)]]
 
     def metastable(outs):
         """[(target label, more stable phase)] for targets that are no longer the stable state."""
         found_all = []
-        for t, o in zip(targets, outs):
+        for t, o in zip(all_targets, outs):
             T, x, css, conds, mu = o
             if mu is None:
                 continue
             try:
+                info = contexts[request_key(t.req)]["strategy"].system_info
                 pt = Point(conds, mu, [c for c in css if c.fixed], [c for c in css if not c.fixed])
-                found = zeq._find_global_min_cs(pt, system_info, pdens=settings.global_min_pdens,
-                                                tol=1e-4, num_candidates=200)
+                found = zeq._find_global_min_cs(pt, info, pdens=settings.global_min_pdens, tol=1e-4,
+                                                num_candidates=200)
             except Exception:
                 found = None
             if found is not None:
@@ -438,14 +577,17 @@ def optimize_invariant(engine: Engine, req: MapRequest, values: Dict[str, float]
 
     floors = np.array([settings.floors.get(var.basis, OTHER_FLOOR) for var in variables])
     wn = math.sqrt(max(settings.norm_weight, 0.0))
+    p0 = np.array([values[n] for n in names], dtype=float)
+    p = p0.copy()
+    centre = p0.copy() if settings.norm_center == "start" else np.zeros_like(p)
+    lim0 = np.array([limit_for(var, pv, settings) for var, pv in zip(variables, p0)])
+    box_lo, box_hi = p0 - settings.max_total * lim0, p0 + settings.max_total * lim0
 
     def norm_rows(pv):
         if wn == 0.0:
             return np.zeros(0)
         return wn * (pv - centre) / floors
 
-    p = np.array([values[n] for n in names], dtype=float)
-    centre = p.copy() if settings.norm_center == "start" else np.zeros_like(p)
     cur = evaluate(values, robust=True)
     if cur is None:
         set_values(values)
@@ -453,7 +595,8 @@ def optimize_invariant(engine: Engine, req: MapRequest, values: Dict[str, float]
     accept(cur)
     r = residuals(cur)
     start_meta = {lab for lab, _ in metastable(cur)} if settings.check_metastable else set()
-    start_note = "start" + ("; already metastable: " + ", ".join(sorted(start_meta)) if start_meta else "")
+    start_note = "start" + ("; already metastable: " + ", ".join(sorted(start_meta)) if start_meta else "") + \
+        (f"; holding {len(holds)} other features" if holds else "")
     hist = [OptIteration(0, dict(zip(names, p)), pts(cur), float(np.max(np.abs(r))), float(r @ r), note=start_note,
                          norm=float(np.sum(((p - centre) / floors) ** 2)))]
     if progress:
@@ -470,7 +613,6 @@ def optimize_invariant(engine: Engine, req: MapRequest, values: Dict[str, float]
             lim = np.array([limit_for(var, pv, settings) for var, pv in zip(variables, p)])
             base = dict(values)
             base.update(zip(names, p))
-            # Jacobian in limit-scaled variables
             J = np.zeros((len(r), len(p)))
             for j in range(len(p)):
                 h = settings.fd_fraction * lim[j]
@@ -487,7 +629,6 @@ def optimize_invariant(engine: Engine, req: MapRequest, values: Dict[str, float]
             if not np.any(J):
                 message = "the targets do not respond to the chosen parameters"
                 break
-            # optional norm rows: d(wn (p - c)/f)/du = wn * lim / f
             Rn = norm_rows(p)
             R = np.concatenate([r, Rn])
             JR = np.vstack([J, np.diag(wn * lim / floors)]) if wn else J
@@ -502,6 +643,11 @@ def optimize_invariant(engine: Engine, req: MapRequest, values: Dict[str, float]
                     u = u / m
                     clipped = True
                 p_new = p + u * lim
+                capped = np.clip(p_new, box_lo, box_hi)
+                if np.any(capped != p_new):
+                    clipped = True
+                    p_new = capped
+                    u = (p_new - p) / lim
                 trial = dict(values)
                 trial.update(zip(names, p_new))
                 out = evaluate(trial)
@@ -509,7 +655,7 @@ def optimize_invariant(engine: Engine, req: MapRequest, values: Dict[str, float]
                     r_new = residuals(out)
                     Rn_new = norm_rows(p_new)
                     if r_new @ r_new + Rn_new @ Rn_new < R @ R:
-                        meta = [m for m in metastable(out) if m[0] not in start_meta] \
+                        meta = [m_ for m_ in metastable(out) if m_[0] not in start_meta] \
                             if settings.reject_metastable else []
                         if not meta:
                             accepted = True
@@ -526,6 +672,9 @@ def optimize_invariant(engine: Engine, req: MapRequest, values: Dict[str, float]
                     message = ("stopped: every step toward the targets makes "
                                + ", ".join(f"{lab} metastable ({ph} more stable)" for lab, ph in rejected_meta)
                                + " — add that feature as a target or vary other parameters")
+                elif np.all((np.abs(p - box_lo) < 1e-12 * np.abs(box_lo) + 1e-12) |
+                            (np.abs(p - box_hi) < 1e-12 * np.abs(box_hi) + 1e-12) | (np.abs(u) < 1e-9)):
+                    message = "stopped at the total-change cap (raise it to allow larger changes)"
                 else:
                     message = "no further improvement (the targets cannot get closer with these parameters and limits)"
                 break
@@ -534,12 +683,19 @@ def optimize_invariant(engine: Engine, req: MapRequest, values: Dict[str, float]
             accept(out)
             r = r_new
             total_new = float(r @ r) + float(Rn_new @ Rn_new)
-            note = "step limited" if clipped else ""
+            notes = []
+            if clipped:
+                notes.append("step limited")
+            share = (u ** 2) / max(float(u @ u), 1e-300)
+            k_dom = int(np.argmax(share))
+            if len(p) > 1 and share[k_dom] > 0.8:
+                notes.append(f"step dominated by {variables[k_dom].name} ({share[k_dom] * 100:.0f}%): "
+                             f"the other parameters barely move these targets")
             if settings.check_metastable and not settings.reject_metastable:
                 for lab, ph in metastable(out):
-                    note = (note + "; " if note else "") + f"{lab} metastable: {ph} is more stable"
+                    notes.append(f"{lab} metastable: {ph} is more stable")
             hist.append(OptIteration(it, dict(zip(names, p)), pts(out), float(np.max(np.abs(r))), float(r @ r),
-                                     clipped, note, norm=float(np.sum(((p - centre) / floors) ** 2))))
+                                     clipped, "; ".join(notes), norm=float(np.sum(((p - centre) / floors) ** 2))))
             if progress:
                 progress(hist[-1])
             if np.max(np.abs(r)) <= 1.0:
@@ -559,4 +715,6 @@ def optimize_invariant(engine: Engine, req: MapRequest, values: Dict[str, float]
                 message = f"within tolerance; the norm was still decreasing after {settings.max_iter} iterations"
     finally:
         set_values({**values, **dict(zip(names, p))})
-    return OptResult(hist, converged, message, time.perf_counter() - t0, targets, list(variables))
+    if holds:
+        message += f" — {len(holds)} other features held"
+    return OptResult(hist, converged, message, time.perf_counter() - t0, targets, list(variables), holds)

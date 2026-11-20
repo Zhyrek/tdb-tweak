@@ -106,6 +106,8 @@ class Boundary:
     phase: str
     x: np.ndarray
     y: np.ndarray
+    partner: str = ""                          # the other phase of the two-phase region (tie-line strategies)
+    partner_x: Optional[np.ndarray] = None     # its x at the same points (binary: composition; ternary: X(B))
 
 
 @dataclass
@@ -116,6 +118,8 @@ class MapResult:
     invariants: List[Tuple[List[str], np.ndarray, np.ndarray]] = field(default_factory=list)
     congruent: List = field(default_factory=list)                       # points.CongruentPoint (binary)
     phase_space: Dict = field(default_factory=dict)                     # phase -> points.composition_space
+    zpf: Optional[object] = None                                        # zpfscore.ZPFScore of the loaded data
+    warm: bool = False                          # started from the previous map's starting points (fast redraw)
     complete: bool = False
     seconds: float = 0.0
     compile_seconds: float = 0.0
@@ -136,6 +140,7 @@ class Engine:
         self.dbf: Optional[Database] = None
         self._cache: Dict[tuple, Tuple[dict, PhaseRecordFactory]] = {}
         self.param_names: Tuple[str, ...] = ()
+        self._starts: Dict[tuple, list] = {}       # request -> starting points of its last full map
 
     def set_database(self, compute_text: str, param_names: Sequence[str]) -> bool:
         """Load the compute database; returns True when it changed (compiled models were dropped)."""
@@ -149,6 +154,7 @@ class Engine:
         self._text_hash = h
         self.param_names = names
         self._cache.clear()
+        self._starts.clear()
         return True
 
     def phases_for(self, elements: Sequence[str]) -> List[str]:
@@ -170,8 +176,16 @@ class Engine:
             self._cache[key] = hit
         return hit
 
+    @staticmethod
+    def _req_key(req: MapRequest) -> tuple:
+        from dataclasses import asdict
+        return tuple(sorted((k, tuple(v_) if isinstance(v_, list) else v_) for k, v_ in asdict(req).items()))
+
     def run(self, req: MapRequest, values: Dict[str, float], cancel: Optional[threading.Event] = None,
-            progress: Optional[Callable[[MapResult], None]] = None, progress_interval: float = 0.4) -> MapResult:
+            progress: Optional[Callable[[MapResult], None]] = None, progress_interval: float = 0.4,
+            warm: bool = False) -> MapResult:
+        """Map ``req``.  ``warm``: start from the previous full map's starting points instead of searching the
+        axis edges again (about 35-55 % faster; a phase region not connected to any of them would be missed)."""
         if self.dbf is None:
             raise RuntimeError("no database loaded")
         t0 = time.perf_counter()
@@ -191,7 +205,19 @@ class Engine:
         with warnings.catch_warnings(), ctx:
             warnings.simplefilter("ignore")
             strategy = strategy_cls(self.dbf, list(comps), list(phases), conds, **kw)
-            strategy.generate_automatic_starting_points()
+            rkey = self._req_key(req)
+            used_warm = False
+            if warm and self._starts.get(rkey):
+                for c_, dirn in self._starts[rkey]:
+                    try:
+                        strategy.add_nodes_from_conditions(c_, dirn)
+                    except Exception:
+                        pass
+                used_warm = len(strategy.node_queue.nodes) > 0
+            if not used_warm:
+                strategy.generate_automatic_starting_points()
+                self._starts[rkey] = [({k: float(np.squeeze(val)) for k, val in n.global_conditions.items()},
+                                       n.axis_direction) for n in strategy.node_queue.nodes]
             last = time.perf_counter()
             finished = False
             while not finished:
@@ -208,9 +234,37 @@ class Engine:
             self.last_strategy = strategy
             result = self._extract(strategy, req, els, phases, final=True)
         result.complete = True
+        result.warm = used_warm
         result.seconds = time.perf_counter() - t0
         result.compile_seconds = t_compile
         return result
+
+    def point(self, req: MapRequest, values: Dict[str, float], T: float, x: Dict[str, float]) -> List[Tuple]:
+        """Equilibrium at one point with the current parameters: [(phase, fraction, {element: x})]."""
+        from pycalphad import Workspace
+        els = [e.upper() for e in req.elements]
+        comps = tuple(sorted(set(els) | {"VA"}))
+        phases = tuple(sorted(req.phases)) if req.phases else tuple(self.phases_for(els))
+        models, prf = self._models(comps, phases, values)
+        params = {k: float(values[k]) for k in self.param_names}
+        prf.update_parameters(params)
+        conds = {v.T: float(T), v.P: req.pressure, v.N: 1.0}
+        for e, val in x.items():
+            conds[v.X(e)] = float(val)
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            wks = Workspace(self.dbf, list(comps), list(phases), conds, models=models, phase_record_factory=prf,
+                            parameters=params)
+            eq = wks.eq
+        ph = np.asarray(eq.Phase).reshape(-1)
+        NP = np.asarray(eq.NP).reshape(-1)
+        X = np.asarray(eq.X).reshape(len(ph), -1)
+        order = sorted(e for e in els)
+        out = []
+        for p_, n_, x_ in zip(ph, NP, X):
+            if str(p_) and np.isfinite(n_) and n_ > 1e-8:
+                out.append((str(p_), float(n_), {e: float(xx) for e, xx in zip(order, x_)}))
+        return out
 
     @staticmethod
     def _conditions(req: MapRequest, els: List[str]):
@@ -249,11 +303,16 @@ class Engine:
                 if len(z.points) == 0:
                     continue
                 pts = []
-                for p in z.stable_phases_with_multiplicity:
+                phs = list(z.stable_phases_with_multiplicity)
+                for p in phs:
                     x = np.asarray(z.get_var_list(_get_phase_specific_variable(p, xs)), dtype=float)
                     y = np.asarray(z.get_var_list(_get_phase_specific_variable(p, ys)), dtype=float)
                     res.boundaries.append(Boundary(p, x, y))
                     pts.append((x, y))
+                if len(phs) == 2:
+                    for k in (0, 1):
+                        bnd = res.boundaries[-2 + k]
+                        bnd.partner, bnd.partner_x = phs[1 - k], pts[1 - k][0]
                 if len(pts) == 2:
                     res.tielines.append(np.stack([np.stack([pts[0][0], pts[0][1]], -1),
                                                   np.stack([pts[1][0], pts[1][1]], -1)], axis=1))

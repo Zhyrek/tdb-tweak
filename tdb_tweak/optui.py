@@ -34,6 +34,8 @@ def _signature(e: Dict) -> tuple:
 
 
 def _distance(a: Dict, b: Dict) -> float:
+    if a["kind"] == "boundary":
+        return abs(a["T"] - b["T"]) / 100.0 + abs(a["cur_x"][a["names"][0]] - b["cur_x"][b["names"][0]])
     if a["kind"] == "tietriangle":
         return sum(abs(a["cur_x"][k] - b["cur_x"].get(k, 9.0)) for k in a["cur_x"])
     return abs(a["T"] - b["T"]) / 100.0
@@ -95,10 +97,41 @@ class OptController:
                 out.append(dict(kind="tietriangle", names=list(n), T=T, spaces=spaces, elements=els, cur_x=cur))
         return out
 
+    def _boundary_curves(self):
+        w = self.win
+        view = w.current_view()
+        res = w._result_for_display(view) if view.kind == "binary" else None
+        return [] if res is None else [b for b in res.boundaries if b.partner and len(b.x) > 1]
+
+    def _boundary_x(self, e: Dict, T: float) -> Optional[Dict]:
+        """Boundary compositions of an entry's two phases at T on the current map (nearest branch)."""
+        best = None
+        for b in self._boundary_curves():
+            if b.phase != e["names"][0] or b.partner != e["names"][1]:
+                continue
+            for k in range(len(b.y) - 1):
+                y0, y1 = b.y[k], b.y[k + 1]
+                if (y0 - T) * (y1 - T) > 0 or y0 == y1:
+                    continue
+                f = (T - y0) / (y1 - y0)
+                x = b.x[k] + f * (b.x[k + 1] - b.x[k])
+                xp = b.partner_x[k] + f * (b.partner_x[k + 1] - b.partner_x[k])
+                d = abs(x - e["cur_x"][e["names"][0]])
+                if best is None or d < best[0]:
+                    best = (d, {e["names"][0]: float(x), e["names"][1]: float(xp)})
+        return None if best is None else best[1]
+
     def refresh_invariants(self):
         """After a map: refresh the 'points on this map' list and the current values of the targets."""
         self._items = self._points()
+        view = self.win.current_view()
         for e in self.entries:
+            if e["kind"] == "boundary":
+                if view.kind == "binary" and list(e["elements"]) == list(view.elements):
+                    got = self._boundary_x(e, e["want_T"])
+                    if got is not None:
+                        e["cur_x"], e["T"] = got, e["want_T"]
+                continue
             cands = [it for it in self._items if _signature(it) == _signature(e)]
             if cands:
                 it = min(cands, key=lambda c: _distance(e, c))
@@ -113,6 +146,8 @@ class OptController:
         return None
 
     def add(self, item: Dict):
+        item = dict(item)
+        item.setdefault("req", self.win.build_request())
         if self._index_of(item) is None:
             self.entries.append(new_entry(item))
         self._sync_panel()
@@ -190,6 +225,9 @@ class OptController:
     def _xy(self, e: Dict):
         """Plot coordinates of the wanted position of an entry: (X, Y, handle keys, movable flags)."""
         view = self._view()
+        if e["kind"] == "boundary":
+            X, Y = to_plot(view, np.array([e["want_x"][e["names"][0]]]), np.array([e["want_T"]]))
+            return X, Y, ["point"], [True]
         if e["kind"] == "congruent":
             x = e["want_x"].get(e["names"][0], e["cur_x"][e["names"][0]])
             X, Y = to_plot(view, np.array([x]), np.array([e["want_T"]]))
@@ -236,7 +274,8 @@ class OptController:
             face = ["white" if m else "#c8c8c8" for m in movable]
             size = 150 if e["kind"] == "congruent" else 90
             a["handles"] = ax.scatter(X, Y, s=size, facecolor="none" if e["kind"] == "congruent" else face,
-                                      edgecolor=COLOR, linewidths=2.2, zorder=9)
+                                      edgecolor=COLOR, linewidths=2.2, zorder=9,
+                                      marker="s" if e["kind"] == "boundary" else "o")
             if e["kind"] == "congruent":
                 a["dot"] = ax.scatter(X, Y, s=18, color=COLOR, zorder=9)
             a["label"] = ax.annotate(f"{i + 1}", (float(np.max(X)), float(Y[int(np.argmax(X))])), xytext=(8, 6),
@@ -334,7 +373,10 @@ class OptController:
             return
         e = self.entries[i]
         view = self._view()
-        if e["kind"] == "tietriangle":
+        if e["kind"] == "boundary":
+            e["want_T"] = float(U.t_to_K(ev.ydata, view.t_unit))
+            e["want_x"][e["names"][0]] = self._binary_x(ev.xdata)
+        elif e["kind"] == "tietriangle":
             b, c = self._ternary_x(ev.xdata, ev.ydata)
             B, C = e["elements"][1], e["elements"][2]
             e["want_x"][f"{what}|{B}"], e["want_x"][f"{what}|{C}"] = b, c
@@ -373,11 +415,39 @@ class OptController:
                 best = (d, it)
         return None if best is None else best[1]
 
+    def _pick_boundary(self, ev, ax) -> Optional[Dict]:
+        """The point of a two-phase boundary nearest to a click (a boundary node)."""
+        view = self._view()
+        best = None
+        for b in self._boundary_curves():
+            X, Y = to_plot(view, b.x, b.y)
+            P = ax.transData.transform(np.c_[X, Y])
+            d = np.hypot(P[:, 0] - ev.x, P[:, 1] - ev.y)
+            k = int(np.nanargmin(d))
+            if d[k] <= PICK_PX and (best is None or d[k] < best[0]):
+                best = (d[k], b, k)
+        if best is None:
+            return None
+        _, b, k = best
+        if abs(b.x[k] - b.partner_x[k]) < 1e-4:
+            return None                                   # a congruent or pure-element end: not a boundary
+        spaces = self.win._result_for_display(view).phase_space or {}
+        if spaces.get(base_phase(b.phase), {}).get("rank", 1) == 0:
+            return None                                   # a line compound's boundary cannot move sideways
+        return dict(kind="boundary", names=[b.phase, b.partner], T=float(b.y[k]),
+                    cur_x={b.phase: float(b.x[k]), b.partner: float(b.partner_x[k])},
+                    spaces=spaces, elements=list(view.elements))
+
     def _context_menu(self, ev, ax):
         view = self._view()
         menu = QMenu(self.win)
         if view.kind in ("binary", "ternary"):
             it = self._pick(ev, ax)
+            node = self._pick_boundary(ev, ax) if (it is None and view.kind == "binary") else None
+            if node is not None:
+                T = f"{U.t_from_K(node['T'], view.t_unit):.6g} {view.t_unit}"
+                menu.addAction(f"Add boundary node: {node['names'][0]} boundary of {node['names'][0]} + "
+                               f"{node['names'][1]} at {T}").triggered.connect(lambda: self.add(node))
             if it is not None:
                 idx = self._index_of(it)
                 if idx is None:
@@ -397,6 +467,10 @@ class OptController:
                 else:
                     menu.addAction(f"Remove target {idx + 1} ({entry_label(it)})").triggered.connect(
                         lambda: self.remove(idx))
+        probe = self._probe_point(ev)
+        if probe is not None:
+            menu.addSeparator()
+            menu.addAction("Equilibrium here").triggered.connect(lambda: self.win.probe(*probe))
         if self.entries:
             menu.addSeparator()
             if self.visible:
@@ -410,6 +484,27 @@ class OptController:
                 view.kind, "(optimization works on binary diagrams and ternary isothermal sections)")
             menu.addAction(msg).setEnabled(False)
         menu.exec(QCursor.pos())
+
+    def _probe_point(self, ev):
+        """(T in K, {element: mole fraction}) of a click, or None outside the diagram."""
+        view = self._view()
+        if ev.xdata is None or ev.ydata is None:
+            return None
+        els = list(view.elements)
+        if view.kind == "binary":
+            return float(U.t_to_K(ev.ydata, view.t_unit)), {els[1]: self._binary_x(ev.xdata)}
+        if view.kind == "ternary":
+            b, c = self._ternary_x(ev.xdata, ev.ydata)
+            if b + c > 1 or b <= 0 or c <= 0:
+                return None
+            return view.temperature, {els[1]: b, els[2]: c}
+        if view.kind == "isopleth":
+            A, B, C = els
+            if U.is_mass(view.x_unit):
+                return None              # an isopleth's wt.% axis depends on all three elements: not converted here
+            xb = float(ev.xdata) / (100.0 if view.x_unit.endswith("%") else 1.0)
+            return float(U.t_to_K(ev.ydata, view.t_unit)), {B: xb, C: view.fixed}
+        return None
 
     def _hide(self):
         self.visible = False
@@ -425,15 +520,14 @@ class OptController:
         if w.doc is None or not self.entries:
             self.panel.status.setText("Add a target first (right-click an invariant, congruent point or tie triangle).")
             return
-        req, err = w.request_from_settings(w.diagram_settings())
-        if req is None or req.kind not in ("binary", "ternary"):
-            self.panel.status.setText(err or "Switch to the diagram (binary, or ternary section) that shows the targets.")
+        req = next((e["req"] for e in self.entries if e.get("req") is not None), None) or w.build_request()
+        if req is None:
+            self.panel.status.setText("No diagram to optimise on.")
             return
-        wrong = [entry_label(e) for e in self.entries
-                 if (e["kind"] == "tietriangle") != (req.kind == "ternary") or list(e["elements"]) != list(req.elements)
-                 or (e["kind"] == "tietriangle" and abs(e["T"] - req.temperature) > 1e-6)]
-        if wrong:
-            self.panel.status.setText("These targets belong to another diagram: " + "; ".join(wrong))
+        bad = [entry_label(e) for e in self.entries
+               if any(el not in w.subsystem for el in e.get("elements", []))]
+        if bad:
+            self.panel.status.setText("Targets with elements outside the edited set: " + "; ".join(bad))
             return
         chosen = self.panel.chosen()
         if not chosen:
@@ -468,8 +562,14 @@ class OptController:
         w.cancel_btn.setEnabled(False)
         k = len(res.iterations) - 1
         self.panel.set_result(res, k)
+        warn = [f for f in getattr(res, "artifacts", []) if f.severity == "warning"]
+        extra = ""
+        if warn:
+            extra = "<br><span style='color:#b35c00'>⚠ " + "<br>⚠ ".join(f.text for f in warn[:4]) + "</span>"
+            for f in res.artifacts:
+                w._log(f"artifact check ({f.severity}): {f.text}")
         self.panel.set_running(False, f"{res.message} ({res.seconds:.1f} s). Applied iteration {k}; select "
-                                      f"another and press Apply, or Ctrl+Z to undo.")
+                                      f"another and press Apply, or Ctrl+Z to undo.{extra}")
         w._log(f"optimize {len(res.targets)} target(s) ({'; '.join(target_label(t) for t in res.targets)}): "
                f"{res.message}, {len(res.variables)} parameters")
         self.apply_iteration(k, res)
