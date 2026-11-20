@@ -75,6 +75,71 @@ Run the tests with `.venv/bin/python -m pytest`.
     * For ternaries, only tie-lines within ±5 K of the section are shown; the tolerance is adjustable.
     * The list of temperatures found in the data maps that section on double-click. Clicking a data point shows its
       reference and enables "Map section at picked point's T".
+* **Optimize (binary invariants and congruent points, ternary tie triangles).** Moves a three-phase invariant (eutectic, peritectic, …)
+  to a target temperature and/or target compositions of its three phases, or a congruent point (congruent melting
+  or a congruent solid-state transformation) to a target temperature and composition, by adjusting the parameters
+  you choose.
+  * **Congruent points** are found on every binary map and marked ◇. The marker is the exact point, solved from
+    equal chemical potentials of both elements in the two phases at one composition; that is accurate to about
+    1 mK and takes a few ms. Right-click one and choose "Optimize congruent point…", then drag the point. If one
+    phase is a line compound (e.g. CuMg₂), the composition is fixed at its stoichiometry and only T can be dragged
+    or targeted.
+  * **Targets:** right-click close to an invariant line or a congruent point and choose "Optimize…". The point is
+    added to the target list in the Optimize tab; the "On this map" list can add points too. Every target is drawn
+    with numbered handles:
+    * invariant: drag the dashed line up or down for T, and each end point sideways for that phase's composition;
+    * congruent point: drag the point.
+    The Want column shows the same values and can be typed into; tick boxes leave single values out.
+  * **Ternary tie triangles:** on an isothermal section, right-click inside (or near) a three-phase triangle and
+    choose "Optimize tie triangle…", then drag its corners. The target is the composition of each corner; T is the
+    section's. At fixed T and P the three corners have no freedom left, so each one is solved directly (pycalphad's
+    solver with the overall composition inside the triangle).
+  * **Stoichiometry:** each phase's reachable compositions come from its sublattice model:
+    * a single composition (line compound): its handle is grey and cannot move, and its composition is not a target;
+      on a binary invariant, pressing it drags the temperature line instead;
+    * a line, e.g. (Fe)(Ni,Cr), where x(Fe) is fixed and Ni and Cr exchange: its handle slides along that line, and
+      typed targets are projected onto it;
+    * otherwise free.
+    This applies to binary invariants (e.g. CuMg₂ in the CuMg₂ + liquid + Laves eutectic), congruent points and tie
+    triangles.
+  * **Robust starts:** if the map used for the optimisation does not contain the feature, the starting phase states
+    are built from the target's compositions: each phase is sampled at T and the lowest-energy state near the
+    corner is used. pycalphad's mapping can find different triangles for equal energies compiled in two ways, so
+    plain coefficients chosen as parameters are converted at once and the diagram is mapped again, before you pick
+    targets.
+  * **Several targets at once:** all targets are optimised together. A target you add but don't drag keeps its
+    current position as the goal, so it **holds that feature in place**. For example, move the Laves melting point
+    while holding the CuMg₂ melting point and the Mg-side eutectic.
+  * **Parameters:** "VV rows shown in table" uses every VV symbol listed in the parameter table after its filters;
+    "Selected table rows" uses only the selected rows, VV or plain coefficients. Any parameter can be unticked.
+  * **Freezing phases:** "Vary parameters of:" has one tick box per phase. Untick a phase, e.g. LIQUID, to freeze
+    every parameter of that phase; a VV symbol shared with a frozen phase is frozen too. The freeze is kept when the
+    list is refilled. This is the simplest way to stop a fit from changing a phase that affects the whole diagram.
+  * **Method:** each iteration solves the invariant directly (pycalphad's solver with the middle-composition phase
+    fixed at zero amount and T free, about 0.3 ms). It builds a finite-difference Jacobian and takes a damped
+    least-squares (Levenberg–Marquardt) step in limit-scaled parameters. That is the most downhill step for the
+    linearised problem and, with more parameters than targets, the smallest one.
+  * **Per-iteration limit:** each parameter changes by at most max(100 % of its current value, floor). The floors
+    are a 50000 J/mol, b 50 J/mol/K, c 7, d 0.05, e 5e-5, f 5e7, each about 50 kJ/mol at 1000 K. The percentage,
+    the floors and per-parameter overrides ("Max Δ / iter") are editable.
+  * **Norm term (optional):** adds weight × Σ ((p − centre)/floor)² to the cost, where a target off by one tolerance
+    costs 1. The centre is zero (keep parameters small) or the starting values (stay close to them).
+    * 0.001: does almost nothing unless a parameter grows to ~100× its floor, i.e. it only stops blow-ups;
+    * 1: strong;
+    * 100: keeps parameters as small as possible, even at the cost of the targets.
+    With the norm on, iterations continue after the targets are met while the total still decreases. In the Cu-Mg
+    test, a weight of 0.05 toward zero reached the same Laves target with parameters about half as large.
+  * **Stopping:** when every target is within tolerance (1 K, 0.1 at.% by default) or after the maximum number of
+    iterations.
+  * **Metastable targets:** a step that makes a target metastable (another phase becomes more stable there) is
+    rejected and shortened by default. The run stops if every step toward the goal would do that. With the option
+    off, such iterations are accepted and flagged in the history.
+  * **Undo:** the final iteration is applied as one undo step and the diagram is mapped again. The iteration
+    history lets you apply any earlier iteration instead, e.g. "a few steps in that direction", or revert to the
+    start. Ctrl+Z works too. The change table shows each parameter's start value, value and Δ/limit; red means
+    the parameter hit its limit.
+  * **Side effects:** only the targets are constrained. Other features (e.g. a neighbouring eutectic) can still move,
+    so add the ones that matter as held targets, and vary only the parameters of the phases taking part.
 * **Files.**
   * **Save TDB** writes only the numbers that changed; the rest of the file stays byte-identical.
   * **Projects** (`*.tdbtweak`) store the TDB path, subsystem, diagram settings, image calibrations, ZPF files and

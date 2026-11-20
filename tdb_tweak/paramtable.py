@@ -259,3 +259,34 @@ class ParamPanel(QWidget):
                     continue
                 self.undo_stack.push(_EditCommand(self, r, self.doc.value(r), self.doc.original_value(r)))
         self.undo_stack.endMacro()
+
+
+def _rows_for_symbols(doc: TDBDocument, names) -> dict:
+    out = {}
+    for r in doc.rows:
+        if r.symbol in names and r.symbol not in out:
+            out[r.symbol] = r
+    return out
+
+
+def apply_symbol_values(panel: "ParamPanel", values: dict, label: str) -> int:
+    """Set parameter values by symbol (VV names or live coefficient symbols) as one undoable step."""
+    doc = panel.doc
+    rows = _rows_for_symbols(doc, set(values))
+    changed = [(rows[n], float(v)) for n, v in values.items() if n in rows and doc.value(rows[n]) != float(v)]
+    if not changed:
+        return 0
+    panel.undo_stack.beginMacro(label)
+    for r, v in changed:
+        panel.undo_stack.push(_EditCommand(panel, r, doc.value(r), v))
+    panel.undo_stack.endMacro()
+    return len(changed)
+
+
+def visible_rows(panel: "ParamPanel"):
+    return list(panel.model.rows)
+
+
+def selected_rows(panel: "ParamPanel"):
+    idx = panel.table.selectionModel().selectedRows()
+    return [panel.model.rows[i.row()] for i in idx]

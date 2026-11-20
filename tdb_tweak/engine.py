@@ -52,7 +52,19 @@ def _install_patch():
                 eq_kwargs["parameters"] = {str(s): float(x) for s, x in zip(prf.param_symbols, prf.param_values)}
             return original(dbf, components, phases, conditions, **eq_kwargs)
 
+        # every module that imported the function keeps its own reference
+        import importlib
+        import pkgutil
+        import pycalphad.mapping as _mapping
+        for info in pkgutil.walk_packages(_mapping.__path__, _mapping.__name__ + "."):
+            try:
+                mod = importlib.import_module(info.name)
+            except Exception:
+                continue
+            if mod is not _sp and getattr(mod, "point_from_equilibrium", None) is original:
+                mod.point_from_equilibrium = point_from_equilibrium
         _sb.point_from_equilibrium = point_from_equilibrium
+        point_from_equilibrium.original = original
         _patched = True
 
 
@@ -102,6 +114,8 @@ class MapResult:
     boundaries: List[Boundary] = field(default_factory=list)          # phase boundary curves
     tielines: List[np.ndarray] = field(default_factory=list)          # each (n_points, 2 phases, 2 xy)
     invariants: List[Tuple[List[str], np.ndarray, np.ndarray]] = field(default_factory=list)
+    congruent: List = field(default_factory=list)                       # points.CongruentPoint (binary)
+    phase_space: Dict = field(default_factory=dict)                     # phase -> points.composition_space
     complete: bool = False
     seconds: float = 0.0
     compile_seconds: float = 0.0
@@ -191,6 +205,7 @@ class Engine:
                     partial.compile_seconds = t_compile
                     progress(partial)
             strategy._mapping_complete = True
+            self.last_strategy = strategy
             result = self._extract(strategy, req, els, phases, final=True)
         result.complete = True
         result.seconds = time.perf_counter() - t0
@@ -250,6 +265,18 @@ class Engine:
                         X.append(float(np.squeeze(node.get_property(_get_phase_specific_variable(p, xs)))))
                         Y.append(float(np.squeeze(node.get_property(_get_phase_specific_variable(p, ys)))))
                     res.invariants.append((names, np.array(X), np.array(Y)))
+            if final:
+                try:
+                    from .points import composition_space
+                    res.phase_space = {ph: composition_space(m, els[1:]) for ph, m in strategy.models.items()}
+                except Exception as ex:
+                    res.message = f"composition spaces: {ex}"
+            if final and req.kind == "binary":
+                try:
+                    from .points import detect_congruent
+                    res.congruent = detect_congruent(strategy, els[0], els[1], strategy.models)
+                except Exception as ex:
+                    res.message = f"congruent points: {ex}"
         else:  # isopleth
             xv, yv = v.X(els[1]), v.T
             for z in lines:

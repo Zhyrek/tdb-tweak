@@ -29,6 +29,7 @@ from .calibdialog import CalibrationDialog, load_rgba
 from .calibration import Calibration
 from .diagram import PhaseColors, View, draw_all
 from .engine import MapRequest, MapResult, cg_available
+from .optui import OptController
 from .paramtable import ParamPanel
 from .tdbmodel import TDBDocument
 from .views import ResultCache, SavedView, auto_name, request_key, same_diagram, values_stamp
@@ -274,6 +275,8 @@ class MainWindow(QMainWindow):
         self.tabs = QTabWidget()
         self.tabs.addTab(self._build_images_tab(), "Literature images")
         self.tabs.addTab(self._build_zpf_tab(), "ZPF data")
+        self.opt = OptController(self)
+        self.tabs.addTab(self.opt.panel, "Optimize")
         self.log = QPlainTextEdit()
         self.log.setReadOnly(True)
         self.tabs.addTab(self.log, "Log")
@@ -281,7 +284,7 @@ class MainWindow(QMainWindow):
         odock.setObjectName("overlays")
         odock.setWidget(self.tabs)
         self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, odock)
-        self.resizeDocks([odock], [330], Qt.Orientation.Horizontal)
+        self.resizeDocks([odock], [540], Qt.Orientation.Horizontal)
 
         # --- signals ---
         self.kind.currentIndexChanged.connect(self._on_kind_changed)
@@ -762,10 +765,12 @@ class MainWindow(QMainWindow):
         if key == self._current_key():
             self.result = res
             self.replot()
+            self.opt.refresh_invariants()
         self._update_state_label(done=msg)
         self._next_in_queue()
 
     def _on_failed(self, msg: str):
+        self.opt.failed(msg)
         self.cancel_btn.setEnabled(False)
         self._pending = None
         self._log("mapping failed: " + msg)
@@ -774,6 +779,7 @@ class MainWindow(QMainWindow):
         self._next_in_queue()
 
     def _on_cancelled(self):
+        self.opt.cancelled()
         self.cancel_btn.setEnabled(False)
         self._pending = None
         self._queue = []
@@ -858,6 +864,7 @@ class MainWindow(QMainWindow):
                 y1 = max(i[1][3] for i in images)
                 ax.set_xlim(x0, x1)
                 ax.set_ylim(y0, y1)
+        self.opt.draw_overlay(ax)
         self._last_drawn = (tuple(ax.get_xlim()), tuple(ax.get_ylim()))
         self._view_key = key
         self.toolbar.update()

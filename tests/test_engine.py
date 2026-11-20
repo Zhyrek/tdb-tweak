@@ -67,3 +67,13 @@ def test_ternary_section_runs():
     r = engine_for(d).run(MapRequest("ternary", ("AL", "CR", "NI"), temperature=1273, xstep=0.04),
                           d.parameter_values())
     assert r.complete and len(r.boundaries) > 5 and r.invariants
+
+
+def test_ternary_section_with_parameters_maps():
+    """Regression: TielineStrategy imports point_from_equilibrium itself; it must be patched too."""
+    d = TDBDocument.from_file(ALCRNI)
+    row = next(r for r in d.rows if r.kind == "COEF" and r.phase == "LIQUID" and "L0(AL,CR,NI)" in r.meaning())
+    d.set_value(row, d.value(row) + 1000)          # now a live parameter
+    r = engine_for(d).run(MapRequest("ternary", ("AL", "CR", "NI"), temperature=1273, xstep=0.04),
+                          d.parameter_values())
+    assert r.complete and r.invariants
