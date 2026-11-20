@@ -142,19 +142,34 @@ class Engine:
         self.param_names: Tuple[str, ...] = ()
         self._starts: Dict[tuple, list] = {}       # request -> starting points of its last full map
 
+    MAX_DATABASES = 4
+
     def set_database(self, compute_text: str, param_names: Sequence[str]) -> bool:
-        """Load the compute database; returns True when it changed (compiled models were dropped)."""
+        """Make a compute database the active one; returns True when it was new (its models compile on first use).
+
+        A few databases stay loaded side by side (e.g. the edited file and a reference file to compare with), each
+        with its own compiled models, so switching between them costs nothing."""
         h = hashlib.sha256(compute_text.encode()).hexdigest()
         names = tuple(sorted(param_names))
-        if h == self._text_hash and names == self.param_names:
+        key = (h, names)
+        if self._text_hash is not None and key == (self._text_hash, self.param_names):
+            return False
+        if not hasattr(self, "_dbs"):
+            self._dbs = {}
+        if self._text_hash is not None:
+            self._dbs[(self._text_hash, self.param_names)] = (self.dbf, self._cache, self._starts)
+        if key in self._dbs:
+            self.dbf, self._cache, self._starts = self._dbs.pop(key)
+            self._dbs[key] = (self.dbf, self._cache, self._starts)        # most recently used last
+            self._text_hash, self.param_names = h, names
             return False
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
             self.dbf = Database.from_string(compute_text, fmt="tdb")
-        self._text_hash = h
-        self.param_names = names
-        self._cache.clear()
-        self._starts.clear()
+        self._cache, self._starts = {}, {}
+        self._text_hash, self.param_names = h, names
+        while len(self._dbs) >= self.MAX_DATABASES:
+            self._dbs.pop(next(iter(self._dbs)))
         return True
 
     def phases_for(self, elements: Sequence[str]) -> List[str]:
@@ -265,6 +280,102 @@ class Engine:
             if str(p_) and np.isfinite(n_) and n_ > 1e-8:
                 out.append((str(p_), float(n_), {e: float(xx) for e, xx in zip(order, x_)}))
         return out
+
+    def _system(self, req: MapRequest, values: Dict[str, float]):
+        els = [e.upper() for e in req.elements]
+        comps = tuple(sorted(set(els) | {"VA"}))
+        phases = tuple(sorted(req.phases)) if req.phases else tuple(self.phases_for(els))
+        models, prf = self._models(comps, phases, values)
+        params = {k: float(values[k]) for k in self.param_names}
+        prf.update_parameters(params)
+        return els, comps, phases, models, prf, params
+
+    def gx_curves(self, req: MapRequest, values: Dict[str, float], T: float, pdens: int = 3000) -> Dict:
+        """Binary G-x curves at T: each phase's lowest molar Gibbs energy at each composition, and the common
+        tangents of the equilibrium along x.  Energies are relative to the straight line between the pure
+        elements' lowest energies (so the differences are visible)."""
+        from pycalphad import Workspace, calculate
+        els, comps, phases, models, prf, params = self._system(req, values)
+        A, B = els[0], els[1]
+        iB = sorted([A, B]).index(B)
+        curves = {}
+        bins = np.linspace(0.0, 1.0, 401)
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            for ph in phases:
+                r = calculate(self.dbf, list(comps), [ph], T=float(T), P=req.pressure, N=1, pdens=pdens,
+                              model=models, phase_records=prf, output="GM", to_xarray=False)
+                X = np.asarray(r.X).reshape(-1, 2)[:, iB]
+                G = np.asarray(r.GM).ravel()
+                ok = np.isfinite(X) & np.isfinite(G)
+                X, G = X[ok], G[ok]
+                if len(X) == 0:
+                    continue
+                if np.ptp(X) < 1e-9:                       # a line compound: one point
+                    curves[ph] = (np.array([X[0]]), np.array([G.min()]))
+                    continue
+                idx = np.digitize(X, bins)
+                xs, gs = [], []
+                for b in np.unique(idx):
+                    sel = idx == b
+                    k = np.argmin(G[sel])
+                    xs.append(X[sel][k])
+                    gs.append(G[sel][k])
+                o = np.argsort(xs)
+                curves[ph] = (np.asarray(xs)[o], np.asarray(gs)[o])
+            # reference line between the pure elements
+            gA = min((g[0] for x, g in curves.values() if x[0] < 2e-3), default=0.0)
+            gB = min((g[-1] for x, g in curves.values() if x[-1] > 1 - 2e-3), default=0.0)
+            # equilibrium along x: common tangents
+            xs = np.linspace(0.005, 0.995, 100)
+            wks = Workspace(self.dbf, list(comps), list(phases),
+                            {v.T: float(T), v.P: req.pressure, v.N: 1.0, v.X(B): xs}, models=models,
+                            phase_record_factory=prf, parameters=params)
+            eq = wks.eq
+            PH = np.asarray(eq.Phase).reshape(len(xs), -1)
+            NP = np.asarray(eq.NP).reshape(len(xs), -1)
+            XX = np.asarray(eq.X).reshape(len(xs), PH.shape[1], -1)[:, :, iB]
+            MU = np.asarray(eq.MU).reshape(len(xs), -1)
+        tangents, seen = [], set()
+        iA = 1 - iB
+        for k in range(len(xs)):
+            live = [j for j in range(PH.shape[1]) if str(PH[k, j]) and np.isfinite(NP[k, j]) and NP[k, j] > 1e-8]
+            if len(live) < 2:
+                continue
+            pts = sorted((float(XX[k, j]), str(PH[k, j])) for j in live)
+            key = tuple((round(x, 3), p) for x, p in pts)
+            if key in seen:
+                continue
+            seen.add(key)
+            mu = MU[k]
+            (x1, p1), (x2, p2) = pts[0], pts[-1]
+            g = lambda x: (1 - x) * mu[iA] + x * mu[iB]
+            tangents.append((x1, g(x1), x2, g(x2), (p1, p2)))
+        return {"T": float(T), "curves": curves, "ref": (gA, gB), "tangents": tangents, "elements": (A, B)}
+
+    def step(self, req: MapRequest, values: Dict[str, float], comp: Dict[str, float], tmin: float, tmax: float,
+             n: int = 300) -> Dict:
+        """Phase fractions vs temperature at a fixed composition."""
+        from pycalphad import Workspace
+        els, comps, phases, models, prf, params = self._system(req, values)
+        Ts = np.linspace(float(tmin), float(tmax), int(n))
+        conds = {v.T: Ts, v.P: req.pressure, v.N: 1.0}
+        for e, x in comp.items():
+            conds[v.X(e)] = float(x)
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            wks = Workspace(self.dbf, list(comps), list(phases), conds, models=models, phase_record_factory=prf,
+                            parameters=params)
+            eq = wks.eq
+        PH = np.asarray(eq.Phase).reshape(len(Ts), -1)
+        NP = np.asarray(eq.NP).reshape(len(Ts), -1)
+        frac: Dict[str, np.ndarray] = {}
+        for k in range(len(Ts)):
+            for j in range(PH.shape[1]):
+                p_ = str(PH[k, j])
+                if p_ and np.isfinite(NP[k, j]) and NP[k, j] > 0:
+                    frac.setdefault(p_, np.zeros(len(Ts)))[k] += NP[k, j]
+        return {"T": Ts, "fractions": frac, "composition": dict(comp)}
 
     @staticmethod
     def _conditions(req: MapRequest, els: List[str]):

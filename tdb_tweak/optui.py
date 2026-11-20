@@ -60,6 +60,8 @@ class OptController:
         p.applyIteration.connect(self.apply_iteration)
         p.useVisibleRequested.connect(lambda: self.fill_variables(selection=False))
         p.useSelectionRequested.connect(lambda: self.fill_variables(selection=True))
+        p.phaseLocksChanged.connect(lambda: self.win.params.model.refresh_values())
+        win.params.locksChanged.connect(p.refresh_locks)
         win.runner.opt_progress.connect(self._on_progress)
         win.runner.opt_finished.connect(self._on_finished)
         c = win.canvas
@@ -197,7 +199,7 @@ class OptController:
         for r in w.doc.rows:
             if r.symbol in seen:
                 phases_of.setdefault(r.symbol, set()).add(r.phase or "(functions)")
-        self.panel.set_variable_rows(uniq, {r.symbol: w.doc.value(r) for r in uniq}, phases_of)
+        self.panel.set_variable_rows(uniq, {r.symbol: w.doc.value(r) for r in uniq}, phases_of, doc=w.doc)
 
     # ------------------------------------------------------------------------------------------ constraints
     def _constrain(self, e: Dict):
@@ -471,6 +473,13 @@ class OptController:
         if probe is not None:
             menu.addSeparator()
             menu.addAction("Equilibrium here").triggered.connect(lambda: self.win.probe(*probe))
+            T, comp = probe
+            if view.kind == "binary":
+                menu.addAction(f"G–x curve at {U.t_from_K(T, view.t_unit):.6g} {view.t_unit}").triggered.connect(
+                    lambda: self.win.open_gx(T))
+            menu.addAction("Step plot at this composition").triggered.connect(lambda: self.win.open_step(comp))
+        menu.addSeparator()
+        menu.addAction("Export figure…").triggered.connect(self.win.export_figure)
         if self.entries:
             menu.addSeparator()
             if self.visible:
@@ -478,11 +487,6 @@ class OptController:
             else:
                 menu.addAction("Show optimization targets").triggered.connect(self._show)
             menu.addAction("Clear all targets").triggered.connect(self.clear)
-        if not menu.actions():
-            msg = {"binary": "(right-click close to an invariant line or a congruent point ◇ to optimize it)",
-                   "ternary": "(right-click inside or near a tie triangle to optimize it)"}.get(
-                view.kind, "(optimization works on binary diagrams and ternary isothermal sections)")
-            menu.addAction(msg).setEnabled(False)
         menu.exec(QCursor.pos())
 
     def _probe_point(self, ev):
@@ -517,8 +521,13 @@ class OptController:
     # ------------------------------------------------------------------------------------------ running
     def run(self):
         w = self.win
-        if w.doc is None or not self.entries:
-            self.panel.status.setText("Add a target first (right-click an invariant, congruent point or tie triangle).")
+        fit = self.panel.fit_zpf.isChecked()
+        if w.doc is None or (not self.entries and not fit):
+            self.panel.status.setText("Add a target first (right-click an invariant, congruent point or tie triangle), "
+                                      "or tick “Fit the loaded ZPF data”.")
+            return
+        if fit and not any(d.enabled for d in w.zpf):
+            self.panel.status.setText("Load ZPF data first (ZPF data tab).")
             return
         req = next((e["req"] for e in self.entries if e.get("req") is not None), None) or w.build_request()
         if req is None:
@@ -529,6 +538,8 @@ class OptController:
         if bad:
             self.panel.status.setText("Targets with elements outside the edited set: " + "; ".join(bad))
             return
+        if not self.panel._rows:
+            self.fill_variables(selection=False)
         chosen = self.panel.chosen()
         if not chosen:
             self.panel.status.setText("Choose at least one parameter to vary.")
@@ -546,10 +557,12 @@ class OptController:
                 rebuild = True
         variables = [Variable(r.symbol, r.basis, f"{r.symbol if r.kind == 'VV' else ''} {r.meaning()}".strip(), lim)
                      for r, lim in chosen]
+        settings = self.panel.settings()
+        settings.zpf_data = [d for d in w.zpf if d.enabled] if fit else []
         self.panel.clear_history()
         self.panel.set_running(True, "optimizing…" + (" (compiling the chosen coefficients first)" if rebuild else ""))
         w.runner.submit_opt(w.doc.compute_text(), list(w.doc.parameter_values()), w.doc.parameter_values(), req,
-                            (variables, targets, self.panel.settings()))
+                            (variables, targets, settings))
         w.cancel_btn.setEnabled(True)
 
     def _on_progress(self, it):

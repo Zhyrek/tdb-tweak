@@ -521,6 +521,7 @@ class TDBDocument:
         self.coef_values: Dict[int, float] = {r.rid: self._coef_value(r) for r in self.rows if r.kind == "COEF"}
         self.coef_orig = dict(self.coef_values)
         self.live: set = set()                          # COEF rids that are symbolic in the compute database
+        self.locked: set = set()                        # symbols (VV names, coefficient symbols) that must not change
 
     # -- loading ------------------------------------------------------------------------------------------
     @classmethod
@@ -633,6 +634,16 @@ class TDBDocument:
             return True
         return False
 
+    def is_locked(self, row: Row) -> bool:
+        return row.symbol in self.locked
+
+    def set_locked(self, rows: Iterable[Row], on: bool) -> None:
+        for r in rows:
+            (self.locked.add if on else self.locked.discard)(r.symbol)
+
+    def rows_of_phase(self, phase: str) -> List[Row]:
+        return [r for r in self.rows if (r.phase or "(functions)") == phase]
+
     def is_modified(self, row: Row) -> bool:
         return self.value(row) != self.original_value(row)
 
@@ -719,7 +730,7 @@ class TDBDocument:
 
     def mark_saved(self):
         """After saving: the current values become the originals (the file now holds them)."""
-        live = set(self.live)
+        live, locked = set(self.live), set(self.locked)
         new = TDBDocument(self.render(), self.path)
         if len(new.rows) != len(self.rows):
             raise RuntimeError("saved file has a different set of editable numbers")
@@ -727,6 +738,7 @@ class TDBDocument:
         # rewriting a number keeps the term, so row ids are unchanged: keep symbolic coefficients symbolic so the
         # compiled models stay valid
         self.live = live
+        self.locked = locked
 
     def masses(self) -> Dict[str, float]:
         return dict(self.elements)

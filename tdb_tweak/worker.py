@@ -21,6 +21,7 @@ class _Worker(QObject):
     opt_finished = pyqtSignal(int, object)
     probe_ready = pyqtSignal(object, object)
     scan_ready = pyqtSignal(object)
+    task_ready = pyqtSignal(int, object)
 
     def __init__(self):
         super().__init__()
@@ -65,6 +66,23 @@ class _Worker(QObject):
             self.probe_ready.emit(point, self.engine.point(request, values, T, x))
         except Exception as ex:
             self.probe_ready.emit(point, f"{type(ex).__name__}: {ex}")
+
+    @pyqtSlot(int, str, str, object, object, object, object)
+    def run_task(self, tid: int, kind: str, compute_text: str, param_names, values, request, args):
+        """Small computations for companion windows (queued behind maps, never cancelling them)."""
+        try:
+            if self.engine is None:
+                self.engine = Engine()
+            self.engine.set_database(compute_text, list(param_names))
+            if kind == "gx":
+                out = self.engine.gx_curves(request, values, args["T"])
+            elif kind == "step":
+                out = self.engine.step(request, values, args["comp"], args["tmin"], args["tmax"])
+            else:
+                raise ValueError(kind)
+            self.task_ready.emit(tid, out)
+        except Exception as ex:
+            self.task_ready.emit(tid, f"{type(ex).__name__}: {ex}")
 
     @pyqtSlot(str, object, object, object)
     def run_scan(self, compute_text: str, param_names, values, request):
@@ -128,6 +146,8 @@ class MapRunner(QObject):
     probe_ready = pyqtSignal(object, object)
     _submit_scan = pyqtSignal(str, object, object, object)
     scan_ready = pyqtSignal(object)
+    _submit_task = pyqtSignal(int, str, str, object, object, object, object)
+    task_ready = pyqtSignal(int, object)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -139,6 +159,9 @@ class MapRunner(QObject):
         self._submit_opt.connect(self._worker.run_opt)
         self._submit_probe.connect(self._worker.run_probe)
         self._submit_scan.connect(self._worker.run_scan)
+        self._submit_task.connect(self._worker.run_task)
+        self._worker.task_ready.connect(self.task_ready)
+        self._tid = 0
         self._worker.scan_ready.connect(self.scan_ready)
         self._worker.probe_ready.connect(self.probe_ready)
         self._worker.opt_progress.connect(lambda j, it: self.opt_progress.emit(it) if j == self._job else None)
@@ -175,6 +198,11 @@ class MapRunner(QObject):
 
     def submit_probe(self, compute_text: str, param_names, values, request, T: float, x: Dict[str, float]):
         self._submit_probe.emit(compute_text, list(param_names), dict(values), request, (T, dict(x)))
+
+    def submit_task(self, kind: str, compute_text: str, param_names, values, request, args) -> int:
+        self._tid += 1
+        self._submit_task.emit(self._tid, kind, compute_text, list(param_names), dict(values), request, dict(args))
+        return self._tid
 
     def submit_scan(self, compute_text: str, param_names, values, request):
         self._submit_scan.emit(compute_text, list(param_names), dict(values), request)

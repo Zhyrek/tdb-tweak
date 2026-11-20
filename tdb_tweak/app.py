@@ -140,6 +140,7 @@ class MainWindow(QMainWindow):
         self.cache = ResultCache()
         self._queue: List[Tuple] = []  # (request, label[, values]) still to map ("Map all views", ghost maps)
         self.checkpoint: Optional[Dict] = None   # {"vv": {...}, "coef": {...}} parameter snapshot for the ghost
+        self.reference: Optional[TDBDocument] = None     # another TDB to compare with (replaces the checkpoint ghost)
         self.ghost_on = True
         self._nudge_timer = QTimer(self)
         self._nudge_timer.setSingleShot(True)
@@ -164,6 +165,13 @@ class MainWindow(QMainWindow):
         self.runner.status.connect(lambda s: self.statusBar().showMessage(s, 8000))
         self.runner.probe_ready.connect(self._on_probe)
         self.runner.scan_ready.connect(self._on_scan)
+        self.runner.task_ready.connect(self._on_task)
+        self._plot_windows: List = []
+        self._task_owner: Dict[int, object] = {}
+        self._plots_timer = QTimer(self)
+        self._plots_timer.setSingleShot(True)
+        self._plots_timer.setInterval(300)
+        self._plots_timer.timeout.connect(self.update_plot_windows)
 
         self._build_ui()
         self._build_menus()
@@ -180,6 +188,7 @@ class MainWindow(QMainWindow):
         self.params.changed.connect(self._on_values_changed)
         self.params.committed.connect(self._on_committed)
         self.params.nudged.connect(self._nudge_timer.start)
+        self.params.changed.connect(lambda *_: self._plots_timer.start())
         self.params.subsystemRequested.connect(self.choose_subsystem)
         dock = QDockWidget("Parameters", self)
         dock.setObjectName("params")
@@ -397,6 +406,9 @@ class MainWindow(QMainWindow):
         self._act(fm, "Save as Next Version", self.save_next_version, QKeySequence("Ctrl+Alt+V"))
         self._act(fm, "Show Changes…", self.show_changes, QKeySequence("Ctrl+D"))
         fm.addSeparator()
+        self._act(fm, "Compare With TDB…", self.compare_with_tdb)
+        self._act(fm, "Stop Comparing", self.stop_comparing)
+        fm.addSeparator()
         self._act(fm, "Open Project…", self.open_project_dialog, QKeySequence("Ctrl+Shift+O"))
         self._act(fm, "Save Project…", self.save_project_dialog, QKeySequence("Ctrl+Alt+S"))
         fm.addSeparator()
@@ -414,6 +426,8 @@ class MainWindow(QMainWindow):
         self._act(em, "Save Checkpoint", self.save_checkpoint, QKeySequence("Ctrl+K"))
         self._act(em, "Revert to Checkpoint", self.revert_to_checkpoint, QKeySequence("Ctrl+Shift+K"))
         self._act(em, "Elements to Edit…", self.choose_subsystem)
+        tm = mb.addMenu("&Tools")
+        self._act(tm, "ESPEI MCMC Polish…", self.espei_polish)
         vm = mb.addMenu("&Diagram")
         self._act(vm, "Redraw", self.redraw, QKeySequence("F5"))
         a = self._act(vm, "Redraw ", self.redraw, QKeySequence("Ctrl+R"))
@@ -821,14 +835,15 @@ class MainWindow(QMainWindow):
         self._map(req, "", fast=bool(fast))
 
     def _map(self, req: MapRequest, label: str, from_queue: bool = False, values: Optional[Dict] = None,
-             fast: bool = False) -> bool:
+             fast: bool = False, text: Optional[str] = None) -> bool:
         """Show the cached map for ``req`` with the current values (or ``values``), or start mapping it.
 
         Returns True when a mapping job was started."""
         ghost = values is not None
         if values is None:
             values = self.doc.parameter_values()
-        key, stamp = request_key(req), values_stamp(self.doc.compute_text(), values)
+        text = text or self.doc.compute_text()
+        key, stamp = request_key(req), values_stamp(text, values)
         hit = self.cache.get(key, stamp)
         if hit is not None and getattr(hit, "warm", False) and not fast and not ghost:
             hit = None                                       # an explicit redraw replaces a fast (warm) map
@@ -842,13 +857,12 @@ class MainWindow(QMainWindow):
             if self._pending[0] == key and self._pending[1] == stamp:
                 return True                                  # already mapping exactly this
             if self._pending[4]:                             # interrupting "Map all": do that one later
-                self._queue.insert(0, (self._pending[3], self._pending[2], self._pending[5]))
+                self._queue.insert(0, (self._pending[3], self._pending[2], self._pending[5], self._pending[6]))
         self._queue = [q for q in self._queue if not (request_key(q[0]) == key and
                                                        (len(q) > 2 and q[2] is not None) == ghost)]
-        self._pending = (key, stamp, label, req, from_queue, values if ghost else None)
+        self._pending = (key, stamp, label, req, from_queue, values if ghost else None, text)
         self._map_started = time.perf_counter()
-        self.runner.submit(self.doc.compute_text(), list(values.keys()), values, req, zpf=self.zpf,
-                           warm=fast and not ghost)
+        self.runner.submit(text, list(values.keys()), values, req, zpf=self.zpf, warm=fast and not ghost)
         self.cancel_btn.setEnabled(True)
         self.state_lbl.setText(f"<span style='color:#0a58ca'>● mapping{' ' + label if label else ''}…</span>")
         self._refresh_view_buttons()
@@ -859,9 +873,10 @@ class MainWindow(QMainWindow):
             item = self._queue.pop(0)
             req, label = item[0], item[1]
             values = item[2] if len(item) > 2 else None
+            text = item[3] if len(item) > 3 else None
             n_left = len(self._queue)
             if self._map(req, f"{label} ({n_left} more queued)" if n_left else label, from_queue=True,
-                         values=values):
+                         values=values, text=text):
                 return
 
     def _on_progress(self, res: MapResult):
@@ -889,7 +904,8 @@ class MainWindow(QMainWindow):
             msg += f"  ·  {res.zpf.text()}"
             ck = self._ghost_result(res.request)
             if ck is not None and ck.zpf is not None and ck.zpf.n:
-                msg += f" (checkpoint {ck.zpf.rms:.0f})"
+                src = self._ghost_source(res.request)
+                msg += f" ({src[3] if src else 'ghost'} {ck.zpf.rms:.0f})"
         if res.message:
             msg += f"  ({res.message})"
         self._log(f"map {'-'.join(res.request.elements)} ({res.request.kind}"
@@ -969,6 +985,74 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage("Not shown (units differ from the diagram's): " + ", ".join(skipped), 8000)
         return out
 
+    # ----------------------------------------------------------------------------------- ESPEI MCMC polish
+    def espei_polish(self):
+        if self.doc is None:
+            return
+        from .espei_polish import EspeiDialog
+        symbols = sorted(n for n in self.doc.vvdefs if n not in self.doc.locked and
+                         any(r.symbol == n for r in self.doc.rows_in(self.subsystem)))
+        default_ds = os.path.dirname(os.path.dirname(self.zpf[0].path)) if self.zpf else ""
+        dlg = EspeiDialog(self.doc.render(), symbols, default_ds, self)
+        dlg.resultReady.connect(self._apply_espei)
+        dlg.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
+        dlg.show()
+
+    def _apply_espei(self, vals: Dict[str, float]):
+        from .paramtable import apply_symbol_values
+        n = apply_symbol_values(self.params, vals, "ESPEI MCMC polish")
+        self._log(f"ESPEI MCMC polish: {n} values changed")
+        self.redraw()
+
+    # ----------------------------------------------------------------------------------- companion plot windows
+    def _open_plot(self, win):
+        win.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
+        win.destroyed.connect(lambda *_: self._plot_windows.remove(win) if win in self._plot_windows else None)
+        self._plot_windows.append(win)
+        win.show()
+        self._submit_plot(win)
+
+    def _submit_plot(self, win):
+        if self.doc is None:
+            return
+        kind, args = win.task()
+        vals = self.doc.parameter_values()
+        tid = self.runner.submit_task(kind, self.doc.compute_text(), list(vals), vals, win.req, args)
+        self._task_owner[tid] = win
+
+    def update_plot_windows(self):
+        for w in list(self._plot_windows):
+            self._submit_plot(w)
+
+    def _on_task(self, tid: int, result):
+        win = self._task_owner.pop(tid, None)
+        if win is None or win not in self._plot_windows:
+            return
+        if any(t > tid and o is win for t, o in self._task_owner.items()):
+            return                                    # a newer computation for this window is coming
+        if isinstance(result, str):
+            win.show_error(result)
+        else:
+            win.show_result(result)
+
+    def open_gx(self, T: float):
+        from .plotwin import GxWindow
+        req = self.build_request()
+        if req is None or req.kind != "binary":
+            return
+        self._open_plot(GxWindow(req, T, self.colors, self.t_unit.currentText(), self))
+
+    def open_step(self, comp: Dict[str, float]):
+        from .plotwin import StepWindow
+        req = self.build_request()
+        if req is None:
+            return
+        if req.kind == "ternary":
+            tmin, tmax = self._T_K(self.tmin), self._T_K(self.tmax)
+        else:
+            tmin, tmax = req.tmin, req.tmax
+        self._open_plot(StepWindow(req, comp, tmin, tmax, self.colors, self.t_unit.currentText(), self))
+
     # ----------------------------------------------------------------------------------- equilibrium probe
     def probe(self, T: float, x: Dict[str, float]):
         if self.doc is None:
@@ -1038,22 +1122,61 @@ class MainWindow(QMainWindow):
                 vals[name] = self.checkpoint["coef"].get(rid, self.doc.coef_orig.get(rid, 0.0))
         return vals
 
-    def _ghost_result(self, req) -> Optional[MapResult]:
-        if not self.ghost_on or req is None:
+    def _ghost_source(self, req):
+        """(request, values, compute text, label) of the ghost map, or None."""
+        if not self.ghost_on or req is None or self.doc is None:
             return None
+        if self.reference is not None:
+            from dataclasses import replace
+            rreq = replace(req, phases=None)       # the reference's own phases of this system
+            return rreq, self.reference.parameter_values(), self.reference.compute_text(), \
+                os.path.basename(self.reference.path or "reference")
         ck = self.checkpoint_values()
         if ck is None or ck == self.doc.parameter_values():
             return None
-        return self.cache.get(request_key(req), values_stamp(self.doc.compute_text(), ck))
+        return req, ck, self.doc.compute_text(), "checkpoint"
+
+    def _ghost_result(self, req) -> Optional[MapResult]:
+        src = self._ghost_source(req)
+        if src is None:
+            return None
+        rreq, vals, text, _ = src
+        return self.cache.get(request_key(rreq), values_stamp(text, vals))
 
     def _queue_ghost(self, req):
-        if not self.ghost_on or self.doc is None:
+        src = self._ghost_source(req)
+        if src is None:
             return
-        ck = self.checkpoint_values()
-        if ck is None or ck == self.doc.parameter_values():
+        rreq, vals, text, label = src
+        if self.cache.get(request_key(rreq), values_stamp(text, vals)) is None:
+            self._queue.insert(0, (rreq, f"ghost ({label})", vals, text))
+
+    def compare_with_tdb(self):
+        path, _ = QFileDialog.getOpenFileName(self, "Compare with TDB", self.settings.value("last_dir", ""),
+                                              "TDB files (*.tdb *.TDB);;All files (*)")
+        if path:
+            self.set_reference(path)
+
+    def set_reference(self, path: str):
+        try:
+            self.reference = TDBDocument.from_file(path)
+        except Exception as ex:
+            QMessageBox.critical(self, "Compare with TDB", str(ex))
             return
-        if self.cache.get(request_key(req), values_stamp(self.doc.compute_text(), ck)) is None:
-            self._queue.insert(0, (req, "checkpoint ghost", ck))
+        self.ghost_on = True
+        self.ghost_act.setChecked(True)
+        self._log(f"comparing with {path}: it is drawn as the grey ghost")
+        req = self.build_request()
+        if req is not None:
+            self._queue_ghost(req)
+            if not self.runner.running:
+                self._next_in_queue()
+        self.replot()
+
+    def stop_comparing(self):
+        self.reference = None
+        self._log("stopped comparing: the ghost shows the checkpoint again")
+        self.replot()
 
     def save_checkpoint(self):
         if self.doc is None:
@@ -1120,6 +1243,9 @@ class MainWindow(QMainWindow):
                 ax.set_xlim(x0, x1)
                 ax.set_ylim(y0, y1)
         self.opt.draw_overlay(ax)
+        src = self._ghost_source(self.build_request())
+        if src is not None and self._ghost_result(self.build_request()) is not None:
+            ax.text(0.01, 0.01, f"grey: {src[3]}", transform=ax.transAxes, fontsize=8, color="#888", zorder=10)
         self._last_drawn = (tuple(ax.get_xlim()), tuple(ax.get_ylim()))
         self._view_key = key
         self.toolbar.update()
@@ -1643,6 +1769,7 @@ class MainWindow(QMainWindow):
         if self.doc is not None:
             import hashlib
             d["tdb_sha1"] = hashlib.sha1(self.doc.text.encode()).hexdigest()
+            d["locked"] = sorted(self.doc.locked)
             d["unsaved_edits"] = {
                 "vv": {k: v for k, v in self.doc.vv_values.items() if v != self.doc.vv_orig[k]},
                 "coef": {str(k): v for k, v in self.doc.coef_values.items() if v != self.doc.coef_orig[k]},
@@ -1702,6 +1829,10 @@ class MainWindow(QMainWindow):
             self.zpf = ds
         self.zpf_tol.setValue(d.get("zpf_tolerance", 5))
         self._refresh_zpf_list()
+        if self.doc is not None and d.get("locked"):
+            known = {r.symbol for r in self.doc.rows}
+            self.doc.locked = {x for x in d["locked"] if x in known}
+            self.params.model.refresh_values()
         ed = d.get("unsaved_edits", {})
         import hashlib
         if self.doc is not None and (ed.get("vv") or ed.get("coef")) and d.get("tdb_sha1") and \

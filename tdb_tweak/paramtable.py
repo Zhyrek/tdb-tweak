@@ -4,9 +4,9 @@ from __future__ import annotations
 from typing import List, Optional, Sequence
 
 from PyQt6.QtCore import QAbstractTableModel, QEvent, QModelIndex, QObject, Qt, pyqtSignal
-from PyQt6.QtGui import QBrush, QColor, QFont, QKeySequence, QUndoCommand, QUndoStack
+from PyQt6.QtGui import QAction, QBrush, QColor, QFont, QKeySequence, QUndoCommand, QUndoStack
 from PyQt6.QtWidgets import (QAbstractItemView, QCheckBox, QComboBox, QHBoxLayout, QHeaderView, QLabel,
-                             QLineEdit, QPushButton, QTableView, QVBoxLayout, QWidget)
+                             QLineEdit, QMenu, QPushButton, QTableView, QVBoxLayout, QWidget)
 
 from .tdbmodel import Row, TDBDocument, fmt_number
 
@@ -46,7 +46,7 @@ class ParamModel(QAbstractTableModel):
 
     def flags(self, index):
         f = Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable
-        if index.column() == 2:
+        if index.column() == 2 and not (self.doc is not None and self.doc.is_locked(self.rows[index.row()])):
             f |= Qt.ItemFlag.ItemIsEditable
         return f
 
@@ -57,7 +57,8 @@ class ParamModel(QAbstractTableModel):
         c = index.column()
         if role in (Qt.ItemDataRole.DisplayRole, Qt.ItemDataRole.EditRole):
             if c == 0:
-                return r.symbol if r.kind == "VV" else "—"
+                lock = "🔒 " if self.doc.is_locked(r) else ""
+                return lock + (r.symbol if r.kind == "VV" else "—")
             if c == 1:
                 return r.meaning()
             if c == 2:
@@ -65,6 +66,8 @@ class ParamModel(QAbstractTableModel):
         if role == Qt.ItemDataRole.BackgroundRole and self.doc.is_lower_order(r, self.elements):
             return QBrush(LOWER_BG)
         if role == Qt.ItemDataRole.ForegroundRole:
+            if self.doc.is_locked(r):
+                return QBrush(QColor(150, 150, 150))
             if self.doc.is_lower_order(r, self.elements):
                 return QBrush(QColor(20, 20, 20))
             if c == 0 and r.kind != "VV":
@@ -83,6 +86,8 @@ class ParamModel(QAbstractTableModel):
                 extra.append(f"original value: {fmt_number(self.doc.original_value(r))}")
             if self.doc.is_lower_order(r, self.elements):
                 extra.append("lower-order parameter: it also changes every sub-system that contains it")
+            if self.doc.is_locked(r):
+                extra.append("locked: not editable and never varied by the optimizer (Ctrl+L or right-click to unlock)")
             uses = [x for x in self.doc.rows if r.kind == "VV" and x.symbol == r.symbol]
             if len(uses) > 1:
                 extra.append(f"{r.symbol} is used in {len(uses)} places; editing one edits all")
@@ -97,6 +102,8 @@ class ParamModel(QAbstractTableModel):
         except ValueError:
             return False
         r = self.rows[index.row()]
+        if self.doc.is_locked(r):
+            return False
         old = self.doc.value(r)
         if new == old:
             return False
@@ -165,6 +172,7 @@ class ParamPanel(QWidget):
     changed = pyqtSignal(bool)
     committed = pyqtSignal()
     nudged = pyqtSignal()
+    locksChanged = pyqtSignal()
     subsystemRequested = pyqtSignal()
 
     def __init__(self, parent=None):
@@ -195,6 +203,13 @@ class ParamPanel(QWidget):
         self.model.valueEdited.connect(self._on_value_edited)
         self.table = QTableView()
         self.table.installEventFilter(_NudgeFilter(self))
+        self.table.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.table.customContextMenuRequested.connect(self._table_menu)
+        lock_act = QAction("Lock / unlock", self)
+        lock_act.setShortcut(QKeySequence("Ctrl+L"))
+        lock_act.setShortcutContext(Qt.ShortcutContext.WidgetWithChildrenShortcut)
+        lock_act.triggered.connect(self.toggle_lock_selected)
+        self.table.addAction(lock_act)
         self.table.setToolTip("Up/Down: choose a parameter · Alt+Up/Down: change it by one step "
                               "(a: 100 J/mol, b: 0.1 J/mol/K, …) · Alt+Shift+Up/Down: ten steps")
         self.table.setModel(self.model)
@@ -301,10 +316,49 @@ class ParamPanel(QWidget):
         if not idx.isValid():
             return
         r = self.model.rows[idx.row()]
+        if self.doc.is_locked(r):
+            return
         old = self.doc.value(r)
         new = float(old + n_steps * nudge_step(r))
         self.undo_stack.push(_NudgeCommand(self, r, old, new))
         self.nudged.emit()
+
+    # locks ----------------------------------------------------------------------------------------------
+    def selected_rows(self) -> List[Row]:
+        return [self.model.rows[i.row()] for i in self.table.selectionModel().selectedRows()]
+
+    def set_locked(self, rows, on: bool):
+        if self.doc is None or not rows:
+            return
+        self.doc.set_locked(rows, on)
+        self.model.refresh_values()
+        self.locksChanged.emit()
+
+    def toggle_lock_selected(self):
+        rows = self.selected_rows()
+        if rows:
+            self.set_locked(rows, not all(self.doc.is_locked(r) for r in rows))
+
+    def _table_menu(self, pos):
+        if self.doc is None:
+            return
+        rows = self.selected_rows()
+        idx = self.table.indexAt(pos)
+        if not rows and idx.isValid():
+            rows = [self.model.rows[idx.row()]]
+        m = QMenu(self)
+        if rows:
+            m.addAction(f"Lock {len(rows)} row(s)\tCtrl+L").triggered.connect(lambda: self.set_locked(rows, True))
+            m.addAction(f"Unlock {len(rows)} row(s)").triggered.connect(lambda: self.set_locked(rows, False))
+            phases = sorted({r.phase or "(functions)" for r in rows})
+            m.addSeparator()
+            for ph in phases:
+                prow = self.doc.rows_of_phase(ph)
+                m.addAction(f"Lock every {ph} parameter").triggered.connect(
+                    lambda _=False, pr=prow: self.set_locked(pr, True))
+                m.addAction(f"Unlock every {ph} parameter").triggered.connect(
+                    lambda _=False, pr=prow: self.set_locked(pr, False))
+        m.exec(self.table.viewport().mapToGlobal(pos))
 
     def revert_all(self):
         if self.doc is None:

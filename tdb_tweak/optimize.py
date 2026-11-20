@@ -80,6 +80,10 @@ class OptSettings:
     norm_center: str = "zero"                # "zero" (small parameters) or "start" (stay near the start values)
     max_total: float = 5.0                   # a parameter moves at most this many per-iteration limits per run
     hold_others: bool = False                # hold every other feature of the targets' diagrams in place
+    reject_artifacts: bool = True            # reject steps that create new artifacts (artifacts.scan)
+    fit_zpf: bool = False                    # also minimise the driving forces of ZPF data
+    zpf_sigma: float = 1000.0                # J/mol per data point (ESPEI's default ZPF uncertainty)
+    zpf_data: list = field(default_factory=list)
     hold_T_tol: float = 5.0                  # K
     hold_x_tol: float = 0.01                 # mole fraction
 
@@ -94,6 +98,7 @@ class OptIteration:
     clipped: bool = False                    # the step hit a parameter limit
     note: str = ""
     norm: float = 0.0                        # sum((p - centre) / floor)^2 of the varied parameters
+    zpf_rms: Optional[float] = None          # ZPF score (J/mol) when the data are fitted too
 
     @property
     def T(self) -> float:                    # first target (single-target use)
@@ -444,10 +449,11 @@ def optimize_invariant(engine: Engine, req: MapRequest, values: Dict[str, float]
     tolerances)."""
     t0 = time.perf_counter()
     targets = [targets] if isinstance(targets, InvariantTarget) else list(targets)
+    fit = bool(settings.fit_zpf and settings.zpf_data)
     if not variables:
         raise ValueError("choose at least one parameter to vary")
-    if not targets:
-        raise ValueError("add at least one target")
+    if not targets and not fit:
+        raise ValueError("add at least one target (or fit the ZPF data)")
     for t in targets:
         if t.req is None:
             t.req = req
@@ -464,7 +470,7 @@ def optimize_invariant(engine: Engine, req: MapRequest, values: Dict[str, float]
     # one map per diagram to locate the features
     from .views import request_key
     contexts = {}
-    for t in targets:
+    for t in targets:  # (no map is needed for a data-only fit)
         k = request_key(t.req)
         if k not in contexts:
             if cancel is not None and cancel.is_set():
@@ -535,6 +541,21 @@ def optimize_invariant(engine: Engine, req: MapRequest, values: Dict[str, float]
                         solvers.append(s_)
     all_targets = targets + holds
 
+    # ZPF data of the systems involved (the targets' diagrams, else the run's)
+    data_reqs = {}
+    for rq in ([t.req for t in targets] or [req]):
+        data_reqs.setdefault(tuple(rq.elements), rq)
+    from .zpfscore import driving_forces
+
+    def data_dfs(vals):
+        out = []
+        for rq in data_reqs.values():
+            out += [d for _, _, d in driving_forces(engine, rq, vals, settings.zpf_data)]
+        set_values(vals)
+        return np.array(out, dtype=float)
+
+    ref_df = None                                # driving forces at the accepted point (fills unsolvable slots)
+
     def evaluate(vals, robust=False):
         set_values(vals)
         outs = []
@@ -545,22 +566,46 @@ def optimize_invariant(engine: Engine, req: MapRequest, values: Dict[str, float]
             if o is None:
                 return None
             outs.append(o)
-        return outs
+        return outs, (data_dfs(vals) if fit else None)
 
-    def residuals(outs):
-        return np.concatenate([_residuals(o[0], o[1], t) for o, t in zip(outs, all_targets)])
+    def residuals(ev):
+        outs, dfs = ev
+        parts = [_residuals(o[0], o[1], t) for o, t in zip(outs, all_targets)]
+        if fit:
+            d = dfs.copy()
+            bad = ~np.isfinite(d)
+            d[bad] = ref_df[bad] if ref_df is not None else 0.0
+            parts.append(d / settings.zpf_sigma)
+        return np.concatenate(parts) if parts else np.zeros(0)
 
-    def accept(outs):
+    def accept(ev):
+        nonlocal ref_df
+        outs, dfs = ev
         for s_, o in zip(solvers, outs):
             s_.accept(o)
+        if fit:
+            ref_df = dfs.copy() if ref_df is None else np.where(np.isfinite(dfs), dfs, ref_df)
+            ref_df[~np.isfinite(ref_df)] = 0.0
 
-    def pts(outs):
-        return [(float(o[0]), dict(o[1])) for o in outs[:len(targets)]]
+    def zrms(ev):
+        if not fit:
+            return None
+        d = ev[1][np.isfinite(ev[1])]
+        return float(np.sqrt(np.mean(d ** 2))) if len(d) else None
 
-    def metastable(outs):
+    def pts(ev):
+        return [(float(o[0]), dict(o[1])) for o in ev[0][:len(targets)]]
+
+    n_t = None                                    # number of target residuals (the rest are data)
+
+    def target_max(rv):
+        rt = rv[:n_t]
+        return float(np.max(np.abs(rt))) if len(rt) else 0.0
+
+    def metastable(ev):
         """[(target label, more stable phase)] for targets that are no longer the stable state."""
         found_all = []
-        for t, o in zip(all_targets, outs):
+        for t, o in zip(all_targets, ev[0]):
             T, x, css, conds, mu = o
             if mu is None:
                 continue
@@ -594,19 +639,33 @@ def optimize_invariant(engine: Engine, req: MapRequest, values: Dict[str, float]
         raise ValueError("could not solve every target at the current values")
     accept(cur)
     r = residuals(cur)
+    n_t = len(r) - (len(cur[1]) if fit else 0)
+    cont = bool(wn) or fit                        # keep going after the targets are met while the total improves
     start_meta = {lab for lab, _ in metastable(cur)} if settings.check_metastable else set()
+
+    from .artifacts import scan as _scan
+
+    def artifacts(vals):
+        found = set()
+        for rq in data_reqs.values():
+            found |= {f.text.split(" (")[0] for f in _scan(engine, rq.elements, vals, phases=rq.phases)
+                      if f.severity == "warning"}
+        set_values(vals)
+        return found
+
+    start_art = artifacts(values) if settings.reject_artifacts else set()
     start_note = "start" + ("; already metastable: " + ", ".join(sorted(start_meta)) if start_meta else "") + \
         (f"; holding {len(holds)} other features" if holds else "")
-    hist = [OptIteration(0, dict(zip(names, p)), pts(cur), float(np.max(np.abs(r))), float(r @ r), note=start_note,
-                         norm=float(np.sum(((p - centre) / floors) ** 2)))]
+    hist = [OptIteration(0, dict(zip(names, p)), pts(cur), target_max(r), float(r[:n_t] @ r[:n_t]), note=start_note,
+                         norm=float(np.sum(((p - centre) / floors) ** 2)), zpf_rms=zrms(cur))]
     if progress:
         progress(hist[-1])
     lam = 1e-3
-    converged = bool(np.max(np.abs(r)) <= 1.0)
+    converged = target_max(r) <= 1.0
     message = "already within tolerance" if converged else ""
     try:
         for it in range(1, settings.max_iter + 1):
-            if converged and not wn:
+            if converged and not cont:
                 break
             if cancel is not None and cancel.is_set():
                 raise Cancelled()
@@ -634,6 +693,7 @@ def optimize_invariant(engine: Engine, req: MapRequest, values: Dict[str, float]
             JR = np.vstack([J, np.diag(wn * lim / floors)]) if wn else J
             accepted = False
             rejected_meta = []
+            rejected_art = set()
             for attempt in range(10):
                 JtJ = JR.T @ JR
                 u = -np.linalg.solve(JtJ + lam * max(np.trace(JtJ) / len(p), 1e-12) * np.eye(len(p)), JR.T @ R)
@@ -657,17 +717,22 @@ def optimize_invariant(engine: Engine, req: MapRequest, values: Dict[str, float]
                     if r_new @ r_new + Rn_new @ Rn_new < R @ R:
                         meta = [m_ for m_ in metastable(out) if m_[0] not in start_meta] \
                             if settings.reject_metastable else []
-                        if not meta:
+                        new_art = (artifacts(trial) - start_art) if (settings.reject_artifacts and not meta) else set()
+                        if not meta and not new_art:
                             accepted = True
                             lam = max(lam / 3.0, 1e-9)
                             break
                         rejected_meta = meta
+                        rejected_art = new_art
                 lam *= 4.0
             if not accepted:
                 if start_meta:
                     message = ("stopped: " + ", ".join(sorted(start_meta)) + " is already metastable at the current "
                                "values (another phase is more stable there), so it cannot be optimised as it is. "
                                "Map again, or pick the feature from a map made after choosing the parameters.")
+                elif rejected_art:
+                    message = ("stopped: every further step creates artifacts — " + "; ".join(sorted(rejected_art)) +
+                               ". Lock or freeze the terms involved, or use a stronger norm.")
                 elif rejected_meta:
                     message = ("stopped: every step toward the targets makes "
                                + ", ".join(f"{lab} metastable ({ph} more stable)" for lab, ph in rejected_meta)
@@ -694,25 +759,30 @@ def optimize_invariant(engine: Engine, req: MapRequest, values: Dict[str, float]
             if settings.check_metastable and not settings.reject_metastable:
                 for lab, ph in metastable(out):
                     notes.append(f"{lab} metastable: {ph} is more stable")
-            hist.append(OptIteration(it, dict(zip(names, p)), pts(out), float(np.max(np.abs(r))), float(r @ r),
-                                     clipped, "; ".join(notes), norm=float(np.sum(((p - centre) / floors) ** 2))))
+            hist.append(OptIteration(it, dict(zip(names, p)), pts(out), target_max(r), float(r[:n_t] @ r[:n_t]),
+                                     clipped, "; ".join(notes), norm=float(np.sum(((p - centre) / floors) ** 2)),
+                                     zpf_rms=zrms(out)))
             if progress:
                 progress(hist[-1])
-            if np.max(np.abs(r)) <= 1.0:
+            what = " and ".join(x for x, on in (("ZPF data", fit), ("norm", bool(wn))) if on)
+            if target_max(r) <= 1.0:
                 converged = True
-                message = f"within tolerance after {it} iteration{'s' if it > 1 else ''}"
-                if wn:
-                    message += " (norm term on: continuing while it lowers the total)"
+                message = (f"targets within tolerance after {it} iteration{'s' if it > 1 else ''}" if n_t else
+                           f"{it} iteration{'s' if it > 1 else ''}")
+                if cont:
+                    message += f" (continuing while the {what} improve{'s' if ' and ' not in what else ''})"
                     if total_old - total_new <= 1e-3 * total_old:
-                        message = f"within tolerance, norm minimised after {it} iterations"
+                        message = (f"targets within tolerance; {what} minimised after {it} iterations" if n_t else
+                                   f"{what} minimised after {it} iterations")
                         break
-            elif wn:
+            elif cont:
                 converged = False
         else:
             if not converged:
                 message = f"stopped after {settings.max_iter} iterations (max |residual| {np.max(np.abs(r)):.3g} tolerances)"
-            elif wn:
-                message = f"within tolerance; the norm was still decreasing after {settings.max_iter} iterations"
+            elif cont:
+                message = (f"targets within tolerance; still improving after {settings.max_iter} iterations" if n_t
+                           else f"stopped after {settings.max_iter} iterations (still improving)")
     finally:
         set_values({**values, **dict(zip(names, p))})
     if holds:

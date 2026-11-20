@@ -103,6 +103,7 @@ class OptPanel(QWidget):
     targetsEdited = pyqtSignal()
     useSelectionRequested = pyqtSignal()
     useVisibleRequested = pyqtSignal()
+    phaseLocksChanged = pyqtSignal()
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -111,7 +112,7 @@ class OptPanel(QWidget):
         self.result: Optional[OptResult] = None
         self._rows: List[Row] = []
         self._phases_of: Dict[str, set] = {}             # symbol -> phases whose parameters use it
-        self.frozen: set = set()                          # phases whose parameters are not varied
+        self.doc = None                                   # the TDBDocument (its locks are the frozen state)
         self._phase_cbs: Dict[str, QCheckBox] = {}
         self._row_meta: List[Tuple[int, str]] = []     # (entry index, "head" / "T" / phase)
         self._building = False
@@ -242,9 +243,22 @@ class OptPanel(QWidget):
                                   "it started (stops one parameter from running away when the others barely act)")
         hr.addWidget(self.hold_others)
         hr.addStretch(1)
+        dr = QHBoxLayout()
+        self.fit_zpf = QCheckBox("Fit the loaded ZPF data")
+        self.fit_zpf.setToolTip("Also minimise the driving forces of the loaded (ticked) ZPF datasets of the targets' "
+                                "systems, σ = 1000 J/mol per point. Works without any dragged target too.")
+        self.reject_art = QCheckBox("Reject steps that create artifacts")
+        self.reject_art.setChecked(True)
+        self.reject_art.setToolTip("A step that creates a new artifact (a solid stable at 4000-6000 K, a high-T "
+                                   "miscibility gap, ...) is shortened instead; checked with Diagram ▸ Check for "
+                                   "Artifacts' scan")
+        dr.addWidget(self.fit_zpf)
+        dr.addWidget(self.reject_art)
+        dr.addStretch(1)
         hr.addWidget(QLabel("Total change ≤"))
         hr.addWidget(self.max_total)
         l2.addLayout(hr)
+        l2.addLayout(dr)
         lay.addWidget(g2)
 
         # --- run + history ---
@@ -422,8 +436,10 @@ class OptPanel(QWidget):
 
     # ----------------------------------------------------------------------------------------- variables
     def set_variable_rows(self, rows: List[Row], values: Dict[str, float],
-                          phases_of: Optional[Dict[str, set]] = None):
+                          phases_of: Optional[Dict[str, set]] = None, doc=None):
         self._rows = rows
+        if doc is not None:
+            self.doc = doc
         self._phases_of = phases_of or {r.symbol: {r.phase or "(functions)"} for r in rows}
         self.var_table.setRowCount(len(rows))
         for i, r in enumerate(rows):
@@ -440,7 +456,7 @@ class OptPanel(QWidget):
         self._build_phase_boxes()
         self._apply_frozen()
 
-    # phase freezing ------------------------------------------------------------------------------------
+    # phase freezing = locking every parameter of a phase (shared with the parameter table) -------------
     def _build_phase_boxes(self):
         while self.phase_grid.count():
             w = self.phase_grid.takeAt(0).widget()
@@ -451,40 +467,60 @@ class OptPanel(QWidget):
         if not phases:
             return
         lab = QLabel("Vary parameters of:")
-        lab.setToolTip("Untick a phase to freeze all of its parameters (a symbol shared with a frozen phase is "
-                       "frozen too)")
+        lab.setToolTip("Unticking a phase locks every parameter of that phase (also in the parameter table); a "
+                       "symbol shared with a locked phase is locked too. Partly ticked: some of its parameters "
+                       "are locked.")
         self.phase_grid.addWidget(lab, 0, 0, 1, 3)
         for k, ph in enumerate(phases):
             cb = QCheckBox(ph)
-            cb.setChecked(ph not in self.frozen)
-            cb.toggled.connect(lambda on, ph=ph: self._toggle_phase(ph, on))
+            cb.setTristate(True)
+            cb.clicked.connect(lambda _=False, ph=ph: self._toggle_phase(ph))
             self.phase_grid.addWidget(cb, 1 + k // 3, k % 3)
             self._phase_cbs[ph] = cb
+        self.refresh_locks()
 
-    def _toggle_phase(self, phase: str, on: bool):
-        if on:
-            self.frozen.discard(phase)
-        else:
-            self.frozen.add(phase)
+    def _phase_rows(self, phase: str):
+        return self.doc.rows_of_phase(phase) if self.doc is not None else []
+
+    def _toggle_phase(self, phase: str):
+        rows = self._phase_rows(phase)
+        if not rows:
+            return
+        all_locked = all(self.doc.is_locked(r) for r in rows)
+        self.doc.set_locked(rows, not all_locked)
+        self.refresh_locks()
+        self.phaseLocksChanged.emit()
+
+    def refresh_locks(self):
+        """Phase boxes and greyed rows from the document's locks."""
+        for ph, cb in self._phase_cbs.items():
+            rows = self._phase_rows(ph)
+            n = sum(1 for r in rows if self.doc.is_locked(r)) if rows else 0
+            st = Qt.CheckState.Checked if n == 0 else (Qt.CheckState.Unchecked if n == len(rows)
+                                                         else Qt.CheckState.PartiallyChecked)
+            cb.blockSignals(True)
+            cb.setCheckState(st)
+            cb.blockSignals(False)
         self._apply_frozen()
 
     def frozen_by(self, r: Row) -> set:
-        return self._phases_of.get(r.symbol, set()) & self.frozen
+        return {"locked"} if (self.doc is not None and self.doc.is_locked(r)) else set()
 
     def _apply_frozen(self):
         grey = QBrush(QColor(160, 160, 160))
         normal = QBrush(self.palette().color(self.foregroundRole()))
         for i, r in enumerate(self._rows):
-            fz = self.frozen_by(r)
+            fz = bool(self.frozen_by(r))
             for j in range(4):
                 it = self.var_table.item(i, j)
                 if it is None:
                     continue
                 it.setForeground(grey if fz else normal)
-                it.setToolTip(f"frozen: {', '.join(sorted(fz))}" if fz else "")
+                it.setToolTip("locked (unlock it in the parameter table or tick its phase)" if fz else "")
             use = self.var_table.item(i, 0)
-            flags = Qt.ItemFlag.ItemIsUserCheckable | (Qt.ItemFlag.NoItemFlags if fz else Qt.ItemFlag.ItemIsEnabled)
-            use.setFlags(flags)
+            if use is not None:
+                use.setFlags(Qt.ItemFlag.ItemIsUserCheckable |
+                             (Qt.ItemFlag.NoItemFlags if fz else Qt.ItemFlag.ItemIsEnabled))
 
     def update_variable_values(self, values: Dict[str, float]):
         for i, r in enumerate(self._rows):
@@ -522,7 +558,8 @@ class OptPanel(QWidget):
         return OptSettings(max_iter=self.max_iter.value(), rel_limit=self.rel.value() / 100, floors=floors,
                            check_metastable=True, reject_metastable=self.reject.isChecked(),
                            norm_weight=self.norm_weight(), norm_center=self.norm_center.currentData(),
-                           max_total=self.max_total.value(), hold_others=self.hold_others.isChecked())
+                           max_total=self.max_total.value(), hold_others=self.hold_others.isChecked(),
+                           fit_zpf=self.fit_zpf.isChecked(), reject_artifacts=self.reject_art.isChecked())
 
     # ----------------------------------------------------------------------------------------- history
     def clear_history(self):
@@ -531,7 +568,7 @@ class OptPanel(QWidget):
         self.changes.setRowCount(0)
 
     def _hist_headers(self, n_targets: int):
-        heads = ["#", "max |r|", "norm"] + [f"{k + 1}: T / x" for k in range(n_targets)] + ["note"]
+        heads = ["#", "max |r|", "norm / ZPF"] + [f"{k + 1}: T / x" for k in range(n_targets)] + ["note"]
         self.hist.setColumnCount(len(heads))
         self.hist.setHorizontalHeaderLabels(heads)
         self.hist.horizontalHeader().setSectionResizeMode(len(heads) - 1, QHeaderView.ResizeMode.Stretch)
@@ -541,7 +578,8 @@ class OptPanel(QWidget):
             self._hist_headers(len(it.points))
         n = self.hist.rowCount()
         self.hist.insertRow(n)
-        cells = [str(it.index), f"{it.residual:.3g}", f"{it.norm:.3g}"]
+        cells = [str(it.index), f"{it.residual:.3g}",
+                 f"{it.norm:.3g}" + (f" / {it.zpf_rms:.0f} J/mol" if it.zpf_rms is not None else "")]
         for T, x in it.points:
             xs = sorted(set(round(v * 100, 4) for v in x.values()))
             cells.append(f"{U.t_from_K(T, self.t_unit):.6g} / " + ", ".join(f"{v:.4g}" for v in xs))

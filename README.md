@@ -5,7 +5,20 @@ pycalphad maps again after each change, with literature images and ESPEI ZPF dat
 
 ## Install
 
-Needs Python 3.11 or newer (3.12 tested).
+Needs Python 3.11 or newer (3.12 tested). Download or clone the repository, then double-click the launcher for your
+system:
+
+| System | Launcher |
+|---|---|
+| Windows | `tdb-tweak.bat` |
+| macOS | `tdb-tweak.command` |
+| Linux | `tdb-tweak.sh` (`./tdb-tweak.sh --desktop` adds a menu entry) |
+
+The first run creates a private environment (`.venv`) next to the launcher and installs everything, which takes a
+few minutes and needs internet. Later runs start the program directly. `--reinstall` repeats the installation. On
+Windows the program runs without a console window.
+
+By hand:
 
 ```bash
 git clone https://github.com/Zhyrek/tdb-tweak.git
@@ -45,6 +58,9 @@ Run the tests with `.venv/bin/python -m pytest`.
   * **Lower-order parameters** are unaries and binaries in a ternary set. They are red, because changing one also
     changes every subsystem that contains it. A toggle hides them.
   * **Non-VV coefficients** shows the plain numbers in PARAMETER expressions so they can be edited too.
+  * **Locks.** Right-click rows ▸ Lock (or Ctrl+L) to stop a value from being edited, nudged or varied by the
+    optimizer; locked rows show 🔒 and are grey. "Lock every <phase> parameter" locks a whole phase. Locks are shared
+    with the optimizer's phase tick boxes and saved in the project.
 * **Diagram (centre).** The diagram types are binary T–x, ternary isothermal section and isopleth (constant x(C)).
   * **Redraw** (F5 or Ctrl+R) maps again. The mapping runs in the background, lines appear as they are traced, and
     Esc cancels. "Redraw on commit" maps again after every Enter in the table.
@@ -52,8 +68,16 @@ Run the tests with `.venv/bin/python -m pytest`.
     searching the axis edges again: about 40 % faster on Cu-Mg and 55 % on the Al-Cr-Ni section. The status line marks
     them "(fast)". A brand-new phase region that touches none of the old starting points could be missed, so F5
     always maps in full.
-  * **Right-click ▸ Equilibrium here** computes the equilibrium at that point with the current parameters and shows
-    the phases, their fractions and compositions.
+  * **Right-click** on the diagram:
+    * **Equilibrium here:** the phases at that point with the current parameters, with their fractions and
+      compositions.
+    * **G–x curve:** binaries. A window with every phase's Gibbs energy across composition at that temperature,
+      relative to the line between the pure elements so the differences are visible. Common tangents of the
+      equilibrium are dashed, and line compounds are points.
+    * **Step plot:** phase fractions vs temperature at that composition.
+    * **Export figure…:** PNG, PDF or SVG. The G–x and step windows have the same entry in their own right-click
+      menu.
+    The G–x and step windows follow your edits: they recompute 0.3 s after a change.
   * **Diagram ▸ Check for Artifacts** scans the current system for typical CALPHAD breakages:
     * a solid stable at 4000–6000 K;
     * a liquid miscibility gap at those temperatures;
@@ -177,6 +201,15 @@ Run the tests with `.venv/bin/python -m pytest`.
   * **Hold everything else:** one tick box. Every other invariant, congruent point and tie triangle of the targets'
     diagrams is then held where it is, within 5 K / 1 at.%. In the Cu-Mg test, moving the Laves maximum by 26 K moved
     nothing else by more than about 2 K; without the hold, other features moved 130–180 K.
+  * **Fit the loaded ZPF data** (tick box): the driving forces of the loaded ZPF datasets of the targets' systems are
+    added as residuals, with σ = 1000 J/mol per point. This works together with dragged targets, holds, locks and
+    the norm, or alone, as a pure data fit of the chosen parameters. The history shows the ZPF score of each
+    iteration.
+  * **Reject steps that create artifacts** (on by default): every candidate step is checked with the artifact scan,
+    and a step that creates a new one is shortened instead. Example, Cu-Mg from the parameter-generation database:
+    * data-only fit without the guard: ZPF 1379 → 176 J/mol, but with high-temperature miscibility gaps in the
+      liquid, FCC and Laves phases;
+    * with the guard: 1379 → 209 J/mol, no artifacts, and much smaller parameter changes.
   * **Runaway guard:**
     * **total-change cap:** over one run, a parameter moves at most N× its per-iteration limit, 5 by default;
     * **dominance note:** when one parameter carries more than 80 % of a step, the history says so, because the
@@ -184,6 +217,15 @@ Run the tests with `.venv/bin/python -m pytest`.
   * **Side effects:** only the targets are constrained. Other features (e.g. a neighbouring eutectic) can still move,
     so add the ones that matter as held targets or use "Hold everything else", and vary only the parameters of the
     phases taking part.
+* **Compare with another TDB** (File menu): draws another file, such as a published assessment or an earlier
+  version, as the grey ghost instead of the checkpoint. With ZPF data loaded, its score appears next to yours, e.g.
+  "ZPF 700 J/mol (Cu-Mg-generated.tdb 1379)". Both databases stay compiled side by side, so redraws are not slowed.
+  File ▸ Stop Comparing goes back to the checkpoint ghost.
+* **ESPEI MCMC polish** (Tools menu): a short ESPEI MCMC run from the current values, using your own ESPEI
+  installation. You choose its Python, e.g. an environment with the fast `backend: cg`. Give an ESPEI input YAML as
+  a template so its tags, prior and data weights are kept, or the phase models and datasets folder. Only unlocked VV
+  parameters are fitted, through ESPEI's `symbols`. The best sample is applied as one undo step. Example: Cu-Mg, 21
+  parameters, 5 iterations with `backend: cg` took 8 s and raised ln p from −4886 to −4814.
 * **Files.**
   * **Save TDB** writes only the numbers that changed; the rest of the file stays byte-identical.
   * **Projects** (`*.tdbtweak`) store the TDB path, subsystem, diagram settings, image calibrations, ZPF files and
@@ -235,6 +277,7 @@ first run includes process start-up.
 * **Map cross-check:** re-check a finished map with point equilibria (or the column-generation solver) on a coarse
   grid and mark lines where they disagree. This would matter if pycalphad's mapping fragility turns out to be a
   frequent problem.
+* **Parameter ties:** keep e.g. L1 = 0 or a fixed b/a ratio during optimization (locks cover the common case).
 * **Literature points by hand + automatic classification:** you mark points on an image, and a model classifies
   them (liquidus, solvus, invariant, which phases) and proposes corrections. This would be an alternative to
   automatic digitizing, which is fragile on real figures. They could then become targets or ESPEI ZPF datasets.

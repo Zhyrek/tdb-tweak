@@ -107,57 +107,69 @@ class _Phases:
         return _gm(cs), np.asarray(res.chemical_potentials, dtype=float), np.asarray(cs.X, dtype=float)
 
 
-def zpf_score(engine, request, values: Dict[str, float], datasets: Sequence[ZPFDataset]) -> Optional[ZPFScore]:
+def driving_forces(engine, request, values: Dict[str, float], datasets: Sequence[ZPFDataset]):
+    """Driving force (J/mol) of every data vertex in a fixed order: [(dataset path, label, df or nan)].
+
+    The order and length depend only on the data, so the list can be used as optimiser residuals; a vertex that
+    cannot be evaluated at some parameter values is nan there."""
     els = list(request.elements[:2] if request.kind == "binary" else request.elements[:3])
     data = [d for d in matching(datasets, els) if d.enabled]
     if not data:
-        return None
+        return []
     comps = tuple(sorted(set(els) | {"VA"}))
     phases = tuple(sorted(request.phases)) if request.phases else tuple(engine.phases_for(els))
     models, prf = engine._models(comps, phases, values)
     prf.update_parameters({k: float(values[k]) for k in engine.param_names})
     P = _Phases(engine, comps, models, prf, els)
-    all_df, per, worst, skipped = [], {}, [], 0
+    out = []
     for ds in data:
-        dfs = []
         for tl in ds.tielines:
-            known, unknown = [], []
+            slots = []                                      # (vertex, base, fractions or None)
             for vx in tl.vertices:
                 base = vx.phase.split("#")[0]
                 if base not in models:
-                    skipped += 1
                     continue
-                fr = fractions_for(vx, els)
-                (known if fr is not None else unknown).append((base, fr, vx.phase))
-            solved = []
-            for base, fr, name in known:
-                out = P.single(base, fr, tl.T)
-                if out is None:
-                    skipped += 1
-                    continue
-                solved.append((base, fr, name, out))
+                slots.append((vx, base, fractions_for(vx, els)))
+            solved = {}
+            for i, (vx, base, fr) in enumerate(slots):
+                if fr is not None:
+                    o = P.single(base, fr, tl.T)
+                    if o is not None:
+                        solved[i] = o
             if len(tl.vertices) == 1 and len(solved) == 1:
-                eq_mu = P.equilibrium_mu(solved[0][1], tl.T)
+                eq_mu = P.equilibrium_mu(slots[next(iter(solved))][2], tl.T)
                 mus = [eq_mu] if eq_mu is not None else []
             else:
-                mus = [o[1] for *_, o in solved if o[1] is not None]
-            if not mus:
-                skipped += len(known) + len(unknown)
-                continue
-            mu = np.mean(mus, axis=0)
-            for base, fr, name, (G, _, Xfull) in solved:
-                df = float(mu @ Xfull - G)
-                dfs.append(df)
-                worst.append((abs(df), f"{ds.label}: {name} at {tl.T:g} K"))
-            for base, _, name in unknown:
-                X, Y, G = P.samples(base, tl.T, pdens=200)
-                df = float(np.max(X @ mu - G))
-                dfs.append(df)
-                worst.append((abs(df), f"{ds.label}: {name} (composition unknown) at {tl.T:g} K"))
-        if dfs:
-            per[ds.path] = (float(np.sqrt(np.mean(np.square(dfs)))), len(dfs))
-            all_df += dfs
-    if not all_df:
-        return ZPFScore(0.0, 0, per, [], skipped)
-    worst.sort(key=lambda t: -t[0])
-    return ZPFScore(float(np.sqrt(np.mean(np.square(all_df)))), len(all_df), per, worst[:8], skipped)
+                mus = [o[1] for o in solved.values() if o[1] is not None]
+            mu = np.mean(mus, axis=0) if mus else None
+            for i, (vx, base, fr) in enumerate(slots):
+                where = f"{ds.label}: {vx.phase}{'' if fr is not None else ' (composition unknown)'} at {tl.T:g} K"
+                if mu is None:
+                    out.append((ds.path, where, float("nan")))
+                elif fr is not None:
+                    if i in solved:
+                        G, _, Xfull = solved[i]
+                        out.append((ds.path, where, float(mu @ Xfull - G)))
+                    else:
+                        out.append((ds.path, where, float("nan")))
+                else:
+                    X, Y, Gs = P.samples(base, tl.T, pdens=200)
+                    out.append((ds.path, where, float(np.max(X @ mu - Gs))))
+    return out
+
+
+def zpf_score(engine, request, values: Dict[str, float], datasets: Sequence[ZPFDataset]) -> Optional[ZPFScore]:
+    dfs = driving_forces(engine, request, values, datasets)
+    if not dfs and not [d for d in matching(datasets, list(request.elements[:2] if request.kind == "binary"
+                                                             else request.elements[:3])) if d.enabled]:
+        return None
+    good = [(p, w, d) for p, w, d in dfs if np.isfinite(d)]
+    per: Dict[str, list] = {}
+    for p, w, d in good:
+        per.setdefault(p, []).append(d)
+    per_ds = {p: (float(np.sqrt(np.mean(np.square(v)))), len(v)) for p, v in per.items()}
+    if not good:
+        return ZPFScore(0.0, 0, per_ds, [], len(dfs))
+    worst = sorted(((abs(d), w) for p, w, d in good), key=lambda t: -t[0])[:8]
+    return ZPFScore(float(np.sqrt(np.mean(np.square([d for _, _, d in good])))), len(good), per_ds, worst,
+                    len(dfs) - len(good))
