@@ -28,8 +28,8 @@ class _Worker(QObject):
         self.engine: Optional[Engine] = None
         self.cancel_events: Dict[int, threading.Event] = {}
 
-    @pyqtSlot(int, str, object, object, object, object, bool)
-    def run(self, job: int, compute_text: str, param_names, values, request, zpf, warm):
+    @pyqtSlot(int, str, object, object, object, object, bool, object)
+    def run(self, job: int, compute_text: str, param_names, values, request, zpf, warm, thermo):
         ev = self.cancel_events.get(job)
         if ev is not None and ev.is_set():
             self.cancelled.emit(job)
@@ -47,6 +47,12 @@ class _Worker(QObject):
                     res.zpf = zpf_score(self.engine, request, values, zpf)
                 except Exception as ex:
                     res.message = (res.message + "; " if res.message else "") + f"ZPF score: {ex}"
+            if thermo:
+                try:
+                    from .thermo import thermo_score
+                    res.thermo = thermo_score(self.engine, request, values, thermo)
+                except Exception as ex:
+                    res.message = (res.message + "; " if res.message else "") + f"thermo score: {ex}"
             self.finished.emit(job, res)
         except Cancelled:
             self.cancelled.emit(job)
@@ -140,7 +146,7 @@ class MapRunner(QObject):
     status = pyqtSignal(str)
     opt_progress = pyqtSignal(object)
     opt_finished = pyqtSignal(object)
-    _submit = pyqtSignal(int, str, object, object, object, object, bool)
+    _submit = pyqtSignal(int, str, object, object, object, object, bool, object)
     _submit_opt = pyqtSignal(int, str, object, object, object, object)
     _submit_probe = pyqtSignal(str, object, object, object, object)
     probe_ready = pyqtSignal(object, object)
@@ -177,14 +183,15 @@ class MapRunner(QObject):
         self.optimizing = False
 
     def submit(self, compute_text: str, param_names: Sequence[str], values: Dict[str, float], request: MapRequest,
-               zpf=None, warm: bool = False):
+               zpf=None, warm: bool = False, thermo=None):
         """Map ``request``; with ZPF datasets, the result also carries their ZPF score (``result.zpf``)."""
         self.cancel()
         self._job += 1
         self._worker.cancel_events[self._job] = threading.Event()
         self.running = True
         self._submit.emit(self._job, compute_text, list(param_names), dict(values), request,
-                          [d for d in (zpf or []) if d.enabled], bool(warm))
+                          [d for d in (zpf or []) if d.enabled], bool(warm),
+                          [d for d in (thermo or []) if d.enabled])
 
     def submit_opt(self, compute_text: str, param_names: Sequence[str], values: Dict[str, float],
                    request: MapRequest, spec):

@@ -5,6 +5,7 @@ import re
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Sequence, Tuple
 
+import matplotlib
 import numpy as np
 from matplotlib.collections import LineCollection
 
@@ -46,6 +47,7 @@ class View:
     zpf_tolerance: float = 5.0                # K, ternary
     tieline_every: int = 0                    # 0: none; binary default off, ternary 3
     show_invariants: bool = True
+    zpf_misfit: Optional[Dict] = None         # (path, tie-line index) -> largest |driving force| (J/mol)
 
 
 # ---------------------------------------------------------------------------------------------------------
@@ -153,11 +155,11 @@ def draw_zpf(ax, view: View, datasets: Sequence[ZPFDataset], colors: PhaseColors
             continue
         pts_by_phase: Dict[str, List] = {}
         segs = []
-        for tl in ds.tielines:
+        for i_tl, tl in enumerate(ds.tielines):
             if view.kind == "ternary" and abs(tl.T - view.temperature) > view.zpf_tolerance:
                 continue
             verts = []
-            for vx in tl.vertices:
+            for i_v, vx in enumerate(tl.vertices):
                 fr = fractions_for(vx, els)
                 if fr is None:
                     continue
@@ -168,7 +170,12 @@ def draw_zpf(ax, view: View, datasets: Sequence[ZPFDataset], colors: PhaseColors
                 X, Y = float(X), float(Y)
                 verts.append((X, Y))
                 info = f"{ds.label}: {vx.phase} at {U.t_from_K(tl.T, view.t_unit):.6g} {view.t_unit}"
-                pts_by_phase.setdefault(vx.phase, []).append((X, Y, info, tl.T))
+                # a tie-line's misfit often sits on a vertex that is not drawn (unknown composition), so each point
+                # shows its tie-line's largest driving force
+                df = view.zpf_misfit.get((ds.path, i_tl)) if view.zpf_misfit is not None else None
+                if df is not None:
+                    info += f" — tie-line misfit {df:.0f} J/mol"
+                pts_by_phase.setdefault(vx.phase, []).append((X, Y, info, tl.T, df))
             if len(verts) >= 2:
                 if len(verts) == 2:
                     segs.append(verts)
@@ -177,8 +184,18 @@ def draw_zpf(ax, view: View, datasets: Sequence[ZPFDataset], colors: PhaseColors
         if segs:
             ax.add_collection(LineCollection(segs, colors="#555555", linewidths=0.7, linestyles="--", zorder=4))
         for phase, pts in pts_by_phase.items():
-            sc = ax.scatter([p[0] for p in pts], [p[1] for p in pts], s=26, marker="o",
-                            facecolor=colors(phase), edgecolor="black", linewidths=0.6, zorder=5, picker=4)
+            if view.zpf_misfit is not None:
+                # fill: the phase; outline: how badly the point fits (green 0 → red ≥ 1000 J/mol, ESPEI's ZPF
+                # uncertainty, and thicker)
+                bad = np.array([min(abs(p[4]) / 1000.0, 1.0) if p[4] is not None else np.nan for p in pts])
+                cmap = matplotlib.colormaps["RdYlGn_r"]
+                edges = [cmap(0.1 + 0.9 * b) if np.isfinite(b) else (0, 0, 0, 1) for b in bad]
+                widths = [1.2 + 2.6 * b if np.isfinite(b) else 0.6 for b in bad]
+                sizes = [34 + 40 * b if np.isfinite(b) else 26 for b in bad]
+            else:
+                edges, widths, sizes = "black", 0.6, 26
+            sc = ax.scatter([p[0] for p in pts], [p[1] for p in pts], s=sizes, marker="o",
+                            facecolor=colors(phase), edgecolor=edges, linewidths=widths, zorder=5, picker=4)
             sc.zpf_info = [p[2] for p in pts]
             sc.zpf_T = [p[3] for p in pts]
             artists.append(sc)

@@ -740,5 +740,29 @@ class TDBDocument:
         self.live = live
         self.locked = locked
 
+    def phase_atoms(self, phase: str) -> float:
+        """Atoms per formula unit: the site ratios of the sublattices that are not vacancies only."""
+        if not hasattr(self, "_atoms"):
+            ratios, cons = {}, {}
+            for c in self.commands:
+                if c.kind == "PHASE":
+                    w = c.text.rstrip("!").split()
+                    try:
+                        n = int(w[3])
+                        ratios[w[1].upper().split(":")[0]] = [float(x) for x in w[4:4 + n]]
+                    except (IndexError, ValueError):
+                        pass
+                elif c.kind == "CONSTITUENT":
+                    w = c.text.rstrip("!").split(None, 2)
+                    if len(w) >= 3:
+                        body = w[2].strip().strip(":")
+                        cons[w[1].upper().split(":")[0]] = [[x.strip().strip("%#").upper() for x in sl.split(",")
+                                                             if x.strip()] for sl in body.split(":")]
+            self._atoms = {}
+            for ph, rs in ratios.items():
+                sls = cons.get(ph, [[]] * len(rs))
+                self._atoms[ph] = sum(r for r, sl in zip(rs, sls) if [x for x in sl if x != "VA"] or not sl) or 1.0
+        return self._atoms.get(phase.upper(), 1.0)
+
     def masses(self) -> Dict[str, float]:
         return dict(self.elements)

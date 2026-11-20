@@ -19,7 +19,7 @@ from PyQt6.QtWidgets import QMenu
 
 from . import units as U
 from .diagram import to_plot
-from .optimize import Variable, target_label
+from .optimize import Variable, linear_step, target_label
 from .optpanel import OptPanel, base_phase, entry_label, fixed_phases, new_entry
 from .paramtable import apply_symbol_values, selected_rows, visible_rows
 from .points import constrain
@@ -34,6 +34,9 @@ def _signature(e: Dict) -> tuple:
 
 
 def _distance(a: Dict, b: Dict) -> float:
+    if a["kind"] == "boundary" and a.get("direction") is not None:
+        n = a["names"][0]
+        return sum(abs(a["cur_x"][k] - b["cur_x"].get(k, 9.0)) for k in a["cur_x"] if k.startswith(n + "|"))
     if a["kind"] == "boundary":
         return abs(a["T"] - b["T"]) / 100.0 + abs(a["cur_x"][a["names"][0]] - b["cur_x"][b["names"][0]])
     if a["kind"] == "tietriangle":
@@ -49,11 +52,16 @@ class OptController:
         self.visible = True
         self._drag = None                   # (entry index, "line" / "point" / key)
         self._artists: List[Dict] = []
+        self._lin = None                    # live drag: {"key": ..., "linear": ...} (valid for one parameter set)
+        self._lin_key = None
+        self._live = None                   # an active live drag: {"start": {symbol: value}, "applied": bool}
+        self._pred: Dict = {}               # live drag: predicted target quantities {(entry index, key): value}
         self._items: List[Dict] = []
         p = self.panel
         p.addRequested.connect(lambda i: self.add(self._items[i]) if 0 <= i < len(self._items) else None)
         p.removeRequested.connect(self.remove)
         p.clearRequested.connect(self.clear)
+        p.export_btn.clicked.connect(self.export_targets)
         p.targetsEdited.connect(self.update_overlay)
         p.runRequested.connect(self.run)
         p.stopRequested.connect(self.win.runner.cancel)
@@ -102,7 +110,7 @@ class OptController:
     def _boundary_curves(self):
         w = self.win
         view = w.current_view()
-        res = w._result_for_display(view) if view.kind == "binary" else None
+        res = w._result_for_display(view) if view.kind in ("binary", "ternary") else None
         return [] if res is None else [b for b in res.boundaries if b.partner and len(b.x) > 1]
 
     def _boundary_x(self, e: Dict, T: float) -> Optional[Dict]:
@@ -123,11 +131,43 @@ class OptController:
                     best = (d, {e["names"][0]: float(x), e["names"][1]: float(xp)})
         return None if best is None else best[1]
 
+    def _refresh_ternary_node(self, e: Dict):
+        """Current state of a ternary boundary node: the nearest point of its boundary on the map."""
+        els = e["elements"]
+        a, b = e["names"]
+        p = np.array([e["want_x"][f"node|{els[1]}"], e["want_x"][f"node|{els[2]}"]])
+        best = None
+        for bb in self._boundary_curves():
+            if bb.phase != a or bb.partner != b or bb.partner_y is None:
+                continue
+            P = np.c_[bb.x, bb.y]
+            Q = np.c_[bb.partner_x, bb.partner_y]
+            for k in range(len(P) - 1):                 # the nearest point on the curve (segments interpolated)
+                sv = P[k + 1] - P[k]
+                t = float(np.clip(np.dot(p - P[k], sv) / max(float(np.dot(sv, sv)), 1e-15), 0.0, 1.0))
+                q = P[k] + t * sv
+                dd = float(np.linalg.norm(q - p))
+                if best is None or dd < best[0]:
+                    best = (dd, q, Q[k] + t * (Q[k + 1] - Q[k]))
+        if best is None:
+            return
+        _, pa, pb = best
+        e["cur_x"].update({f"{a}|{els[1]}": float(pa[0]), f"{a}|{els[2]}": float(pa[1]),
+                           f"{b}|{els[1]}": float(pb[0]), f"{b}|{els[2]}": float(pb[1]),
+                           f"node|{els[1]}": float(pa[0]), f"node|{els[2]}": float(pa[1])})
+        d = pb - pa
+        if np.linalg.norm(d) > 1e-9:
+            e["direction"] = (d / np.linalg.norm(d)).tolist()
+
     def refresh_invariants(self):
         """After a map: refresh the 'points on this map' list and the current values of the targets."""
         self._items = self._points()
         view = self.win.current_view()
         for e in self.entries:
+            if e["kind"] == "boundary" and e.get("direction") is not None:
+                if view.kind == "ternary" and list(e["elements"]) == list(view.elements):
+                    self._refresh_ternary_node(e)
+                continue
             if e["kind"] == "boundary":
                 if view.kind == "binary" and list(e["elements"]) == list(view.elements):
                     got = self._boundary_x(e, e["want_T"])
@@ -227,6 +267,10 @@ class OptController:
     def _xy(self, e: Dict):
         """Plot coordinates of the wanted position of an entry: (X, Y, handle keys, movable flags)."""
         view = self._view()
+        if e["kind"] == "boundary" and e.get("direction") is not None:
+            els = e["elements"]
+            X, Y = to_plot(view, np.array([e["want_x"][f"node|{els[1]}"]]), np.array([e["want_x"][f"node|{els[2]}"]]))
+            return X, Y, ["point"], [True]
         if e["kind"] == "boundary":
             X, Y = to_plot(view, np.array([e["want_x"][e["names"][0]]]), np.array([e["want_T"]]))
             return X, Y, ["point"], [True]
@@ -261,7 +305,8 @@ class OptController:
         if not self.visible:
             return
         for i, e in enumerate(self.entries):
-            if (e["kind"] == "tietriangle") != (view.kind == "ternary"):
+            if (e["kind"] == "tietriangle" or (e["kind"] == "boundary" and e.get("direction") is not None)) \
+                    != (view.kind == "ternary"):
                 continue
             if list(e["elements"]) != list(view.elements):
                 continue
@@ -280,6 +325,7 @@ class OptController:
                                       marker="s" if e["kind"] == "boundary" else "o")
             if e["kind"] == "congruent":
                 a["dot"] = ax.scatter(X, Y, s=18, color=COLOR, zorder=9)
+            a["pred"] = ax.scatter([], [], s=28, color=COLOR, zorder=10, marker="o")
             a["label"] = ax.annotate(f"{i + 1}", (float(np.max(X)), float(Y[int(np.argmax(X))])), xytext=(8, 6),
                                      textcoords="offset points", fontsize=9, fontweight="bold", color="#a0006d",
                                      zorder=9)
@@ -305,8 +351,40 @@ class OptController:
             if "dot" in a:
                 a["dot"].set_offsets(np.c_[X, Y])
             a["label"].xy = (float(np.max(X)), float(Y[int(np.argmax(X))]))
+            if "pred" in a:
+                P = self._predicted_xy(a["entry"])
+                a["pred"].set_offsets(P if P is not None else np.empty((0, 2)))
         self.panel.refresh_values()
         self.win.canvas.draw_idle()
+
+    def _predicted_xy(self, i: int):
+        """Plot positions where the live linear model predicts entry i's feature to be."""
+        if not self._pred:
+            return None
+        e = self.entries[i]
+        view = self._view()
+        T = self._pred.get((i, "T"), e["T"])
+        get = lambda k: self._pred.get((i, k), e["cur_x"].get(k))
+        if e["kind"] == "tietriangle":
+            B, C = e["elements"][1], e["elements"][2]
+            X, Y = to_plot(view, np.array([get(f"{n}|{B}") for n in e["names"]]),
+                           np.array([get(f"{n}|{C}") for n in e["names"]]))
+        elif e["kind"] == "congruent":
+            X, Y = to_plot(view, np.array([get(e["names"][0])]), np.array([T]))
+        elif e["kind"] == "boundary" and e.get("direction") is not None:
+            els, a = e["elements"], e["names"][0]
+            d = np.asarray(e["direction"])
+            cur = np.array([e["cur_x"][f"{a}|{els[1]}"], e["cur_x"][f"{a}|{els[2]}"]])
+            pred = self._pred.get((i, f"{a}|across"))
+            if pred is None:
+                return None
+            q = cur + (pred - float(cur @ d)) * d
+            X, Y = to_plot(view, np.array([q[0]]), np.array([q[1]]))
+        elif e["kind"] == "boundary":
+            X, Y = to_plot(view, np.array([get(e["names"][0])]), np.array([e["want_T"]]))
+        else:
+            X, Y = to_plot(view, np.array([get(n) for n in e["names"]]), np.full(len(e["names"]), T))
+        return np.c_[X, Y]
 
     # ------------------------------------------------------------------------------------------ mouse
     def _ax(self):
@@ -350,6 +428,7 @@ class OptController:
                         best = (d, (a["entry"], "line"))
         if best is not None:
             self._drag = best[1]
+            self._live_start()
 
     def _binary_x(self, xd: float) -> float:
         view = self._view()
@@ -375,7 +454,11 @@ class OptController:
             return
         e = self.entries[i]
         view = self._view()
-        if e["kind"] == "boundary":
+        if e["kind"] == "boundary" and e.get("direction") is not None:
+            b, c = self._ternary_x(ev.xdata, ev.ydata)
+            els = e["elements"]
+            e["want_x"][f"node|{els[1]}"], e["want_x"][f"node|{els[2]}"] = b, c
+        elif e["kind"] == "boundary":
             e["want_T"] = float(U.t_to_K(ev.ydata, view.t_unit))
             e["want_x"][e["names"][0]] = self._binary_x(ev.xdata)
         elif e["kind"] == "tietriangle":
@@ -389,10 +472,15 @@ class OptController:
                 e["want_x"][e["names"][0]] = self._binary_x(ev.xdata)
             if what not in ("line", "point") and what in e["want_x"]:
                 e["want_x"][what] = self._binary_x(ev.xdata)
+        if self._live is not None and self._lin is not None:
+            self._live_update()
         self.update_overlay()
 
     def _on_release(self, ev):
+        was = self._drag
         self._drag = None
+        if was is not None and self._live is not None:
+            self._live_finish()
 
     def _pick(self, ev, ax):
         view = self._view()
@@ -436,6 +524,18 @@ class OptController:
         spaces = self.win._result_for_display(view).phase_space or {}
         if spaces.get(base_phase(b.phase), {}).get("rank", 1) == 0:
             return None                                   # a line compound's boundary cannot move sideways
+        if view.kind == "ternary":
+            if b.partner_y is None:
+                return None
+            els = list(view.elements)
+            pa, pb = np.array([b.x[k], b.y[k]]), np.array([b.partner_x[k], b.partner_y[k]])
+            if np.linalg.norm(pb - pa) < 1e-4:
+                return None
+            d = (pb - pa) / np.linalg.norm(pb - pa)
+            return dict(kind="boundary", names=[b.phase, b.partner], T=float(view.temperature), spaces=spaces,
+                        elements=els, direction=d.tolist(),
+                        cur_x={f"{b.phase}|{els[1]}": float(pa[0]), f"{b.phase}|{els[2]}": float(pa[1]),
+                               f"{b.partner}|{els[1]}": float(pb[0]), f"{b.partner}|{els[2]}": float(pb[1])})
         return dict(kind="boundary", names=[b.phase, b.partner], T=float(b.y[k]),
                     cur_x={b.phase: float(b.x[k]), b.partner: float(b.partner_x[k])},
                     spaces=spaces, elements=list(view.elements))
@@ -445,11 +545,12 @@ class OptController:
         menu = QMenu(self.win)
         if view.kind in ("binary", "ternary"):
             it = self._pick(ev, ax)
-            node = self._pick_boundary(ev, ax) if (it is None and view.kind == "binary") else None
+            node = self._pick_boundary(ev, ax) if it is None else None
             if node is not None:
-                T = f"{U.t_from_K(node['T'], view.t_unit):.6g} {view.t_unit}"
+                where = (f"at {U.t_from_K(node['T'], view.t_unit):.6g} {view.t_unit}" if view.kind == "binary"
+                         else "of this section")
                 menu.addAction(f"Add boundary node: {node['names'][0]} boundary of {node['names'][0]} + "
-                               f"{node['names'][1]} at {T}").triggered.connect(lambda: self.add(node))
+                               f"{node['names'][1]} {where}").triggered.connect(lambda: self.add(node))
             if it is not None:
                 idx = self._index_of(it)
                 if idx is None:
@@ -469,6 +570,7 @@ class OptController:
                 else:
                     menu.addAction(f"Remove target {idx + 1} ({entry_label(it)})").triggered.connect(
                         lambda: self.remove(idx))
+        self._mark_menu(menu, ev, ax)
         probe = self._probe_point(ev)
         if probe is not None:
             menu.addSeparator()
@@ -510,6 +612,45 @@ class OptController:
             return float(U.t_to_K(ev.ydata, view.t_unit)), {B: xb, C: view.fixed}
         return None
 
+    def export_targets(self):
+        from PyQt6.QtWidgets import QFileDialog
+        from .espei_export import dataset_dicts, write
+        if not self.entries:
+            self.panel.status.setText("No targets to export.")
+            return
+        folder = QFileDialog.getExistingDirectory(self.win, "Folder for the ESPEI datasets")
+        if not folder:
+            return
+        import os
+        paths = []
+        for els, d in dataset_dicts(self.entries).items():
+            paths.append(write(os.path.join(folder, f"tdbtweak-targets-{'-'.join(els)}.json"), d))
+        self.win._log("exported targets as ESPEI ZPF data: " + ", ".join(paths))
+        self.panel.status.setText(f"Wrote {len(paths)} dataset(s) to {folder}.")
+
+    def _mark_menu(self, menu, ev, ax):
+        """Right-click: mark a data point here, interpreted from the nearest computed boundary."""
+        view = self._view()
+        if view.kind not in ("binary", "ternary") or ev.xdata is None:
+            return
+        best = None
+        for b in self._boundary_curves():
+            X, Y = to_plot(view, b.x, b.y)
+            P = ax.transData.transform(np.c_[X, Y])
+            d = np.hypot(P[:, 0] - ev.x, P[:, 1] - ev.y)
+            k = int(np.nanargmin(d))
+            if best is None or d[k] < best[0]:
+                best = (d[k], b)
+        pt = self._probe_point(ev)
+        if best is None or pt is None:
+            return
+        b = best[1]
+        T, comp = pt
+        sub = menu.addMenu("Mark data point here")
+        for ph, partner in ((b.phase, b.partner), (b.partner, b.phase)):
+            sub.addAction(f"{ph} boundary of {ph} + {partner}").triggered.connect(
+                lambda _=False, ph=ph, partner=partner: self.win.mark_point(T, comp, ph, partner))
+
     def _hide(self):
         self.visible = False
         self.win.replot()
@@ -519,6 +660,130 @@ class OptController:
         self.win.replot()
 
     # ------------------------------------------------------------------------------------------ running
+    def _job_inputs(self):
+        """(request, variables, targets, settings) of an optimisation of the current targets, or an error text."""
+        w = self.win
+        if w.doc is None or not self.entries:
+            return "no targets"
+        req = next((e["req"] for e in self.entries if e.get("req") is not None), None) or w.build_request()
+        if not self.panel._rows:
+            self.fill_variables(selection=False)
+        chosen = self.panel.chosen()
+        if not chosen:
+            return "Choose at least one parameter to vary."
+        for r, _ in chosen:
+            if r.kind == "COEF" and r.rid not in w.doc.live:
+                return "Map once after choosing coefficient parameters (they are compiled first)."
+        variables = [self._variable(r, lim) for r, lim in chosen]
+        targets = self.panel.build_targets()
+        settings = self.panel.settings()
+        settings.zpf_data = [d for d in w.zpf if d.enabled] if self.panel.fit_zpf.isChecked() else []
+        return req, variables, targets, settings
+
+    def _variable(self, r, lim):
+        doc = self.win.doc
+        phases = {x.phase for x in doc.rows if x.symbol == r.symbol and x.phase}
+        atoms = max((doc.phase_atoms(p) for p in phases), default=1.0)
+        return Variable(r.symbol, r.basis, f"{r.symbol if r.kind == 'VV' else ''} {r.meaning()}".strip(), lim,
+                        atoms=atoms)
+
+    # live drag ------------------------------------------------------------------------------------------
+    def _live_key(self):
+        from .views import values_stamp
+        w = self.win
+        return (values_stamp(w.doc.compute_text(), w.doc.parameter_values()),
+                tuple((e["kind"], tuple(e["names"]), round(e["T"], 3)) for e in self.entries),
+                tuple(r.symbol for r, _ in self.panel.chosen()), self.panel.hold_others.isChecked(),
+                self.panel.fit_zpf.isChecked(), self.panel.norm_weight())
+
+    def _live_start(self):
+        """At a press: make sure a linear model for the current parameters exists (or is being computed)."""
+        w = self.win
+        if not self.panel.live.isChecked() or w.runner.running:
+            return
+        key = self._live_key()
+        self._live = {"start": {r.symbol: w.doc.value(r) for r, _ in self.panel.chosen()}, "applied": False}
+        if self._lin is not None and self._lin_key == key:
+            return
+        inp = self._job_inputs()
+        if isinstance(inp, str):
+            self._live = None
+            return
+        req, variables, targets, settings = inp
+        # the user's targets at their current positions: the model is linearised at the current state
+        for t, e in zip(targets, self.entries):
+            if e["kind"] != "tietriangle" and e["kind"] != "boundary":
+                t.T_target = e["T"]
+            if e["kind"] == "boundary" and e.get("direction") is not None:
+                els, a = e["elements"], e["names"][0]
+                cur = np.array([e["cur_x"][f"{a}|{els[1]}"], e["cur_x"][f"{a}|{els[2]}"]])
+                t.point = tuple(cur)
+                t.x_target = {f"{a}|across": float(cur @ np.asarray(e["direction"]))}
+                continue
+            t.x_target = {k: (e["cur_x"].get(k, v) if v is not None else None) for k, v in t.x_target.items()}
+        settings.jacobian_only = True
+        settings.reject_artifacts = False
+        self._lin, self._lin_key = None, key
+        self._lin_wait = key
+        self.panel.status.setText("live drag: computing how the targets respond to the parameters…")
+        w.runner.submit_opt(w.doc.compute_text(), list(w.doc.parameter_values()), w.doc.parameter_values(), req,
+                            (variables, targets, settings))
+
+    def _on_linear(self, res):
+        if getattr(self, "_lin_wait", None) is None:
+            return
+        self._lin = res.linear
+        self._lin["max_total"] = 1.0              # trust region: one per-iteration limit of change
+        self._lin_wait = None
+        self.panel.status.setText(f"live drag ready ({len(res.linear['names'])} parameters, "
+                                  f"{len(res.holds)} held features): drag the handles")
+        self.win.cancel_btn.setEnabled(False)
+        if self._drag is not None:
+            self._live_update()
+
+    def _live_update(self):
+        """Apply the linear model for the current handle positions (called on every mouse move)."""
+        w = self.win
+        if self._lin is None or self._live is None:
+            return
+        wanted = {}
+        for i, e in enumerate(self.entries):
+            if e["kind"] not in ("tietriangle", "boundary"):
+                wanted[(i, "T")] = e["want_T"]
+            if e["kind"] == "boundary" and e.get("direction") is not None:
+                els = e["elements"]
+                p = np.array([e["want_x"][f"node|{els[1]}"], e["want_x"][f"node|{els[2]}"]])
+                wanted[(i, f"{e['names'][0]}|across")] = float(p @ np.asarray(e["direction"]))
+                continue
+            for k, val in e["want_x"].items():
+                wanted[(i, k)] = val
+        vals, pred = linear_step(self._lin, wanted)
+        rows = {r.symbol: r for r in w.doc.rows if r.symbol in vals}
+        for name, v in vals.items():
+            r = rows.get(name)
+            if r is not None and not w.doc.is_locked(r):
+                w.doc.set_value(r, v)
+        self._live["applied"] = True
+        self._pred = {k: v for k, v in pred.items() if k[0] < len(self.entries)}
+        w.params.model.refresh_values()
+        w._nudge_timer.start()                   # fast redraw when the mouse pauses
+
+    def _live_finish(self):
+        """At release: one undo step from the values before the drag to the values now."""
+        w = self.win
+        live, self._live = self._live, None
+        self._pred = {}
+        if live is None or not live["applied"]:
+            return
+        final = {s_: w.doc.value(next(r for r in w.doc.rows if r.symbol == s_)) for s_ in live["start"]}
+        rows = {r.symbol: r for r in w.doc.rows if r.symbol in live["start"]}
+        for s_, v in live["start"].items():
+            w.doc.set_value(rows[s_], v)
+        apply_symbol_values(w.params, final, "live drag")
+        self._lin, self._lin_key = None, None     # the parameters changed: the next press linearises again
+        w._nudge_timer.stop()
+        w.redraw(fast=True)
+
     def run(self):
         w = self.win
         fit = self.panel.fit_zpf.isChecked()
@@ -555,8 +820,7 @@ class OptController:
             if r.kind == "COEF" and r.rid not in w.doc.live:
                 w.doc.live.add(r.rid)
                 rebuild = True
-        variables = [Variable(r.symbol, r.basis, f"{r.symbol if r.kind == 'VV' else ''} {r.meaning()}".strip(), lim)
-                     for r, lim in chosen]
+        variables = [self._variable(r, lim) for r, lim in chosen]
         settings = self.panel.settings()
         settings.zpf_data = [d for d in w.zpf if d.enabled] if fit else []
         self.panel.clear_history()
@@ -572,6 +836,9 @@ class OptController:
 
     def _on_finished(self, res):
         w = self.win
+        if getattr(res, "linear", None) is not None:
+            self._on_linear(res)
+            return
         w.cancel_btn.setEnabled(False)
         k = len(res.iterations) - 1
         self.panel.set_result(res, k)

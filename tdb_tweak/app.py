@@ -127,6 +127,7 @@ class MainWindow(QMainWindow):
         self.excluded_phases: set = set()
         self.images: List[ImageEntry] = []
         self.zpf: List[ZPFDataset] = []
+        self.thermo: List = []                       # thermo.ThermoDataset
         self.result: Optional[MapResult] = None
         self.result_values_stamp = None
         self.colors = PhaseColors()
@@ -208,11 +209,17 @@ class MainWindow(QMainWindow):
         self.x_unit = QComboBox()
         self.x_unit.addItems(U.X_UNITS)
         self.solver = QComboBox()
-        self.solver.addItem("pycalphad solver", False)
-        self.solver.addItem("column generation (pycalphad-cg)", True)
+        self.solver.addItem("auto (fastest)", "auto")
+        self.solver.addItem("pycalphad solver", "pycalphad")
+        self.solver.addItem("column generation (pycalphad-cg)", "cg")
         if not cg_available():
-            self.solver.model().item(1).setEnabled(False)
-            self.solver.setToolTip("pycalphad-cg is not installed: pip install pycalphad-cg")
+            for i in (0, 2):
+                self.solver.model().item(i).setEnabled(False)
+            self.solver.setCurrentIndex(1)
+            self.solver.setToolTip("pycalphad-cg is not installed: pip install pycalphad-cg (or the [cg] extra)")
+        else:
+            self.solver.setToolTip("auto: both solvers are timed on the first map of a diagram (and every 30 maps "
+                                   "after); the faster one is used")
         self.phases_btn = QPushButton("Phases…")
         self.redraw_btn = QPushButton("Redraw  (F5)")
         self.redraw_btn.setStyleSheet("font-weight: bold;")
@@ -308,6 +315,11 @@ class MainWindow(QMainWindow):
         self.log = QPlainTextEdit()
         self.log.setReadOnly(True)
         self.tabs.addTab(self.log, "Log")
+        from PyQt6.QtWidgets import QUndoView
+        self.history = QUndoView(self.params.undo_stack)
+        self.history.setEmptyLabel("(file as opened)")
+        self.history.setToolTip("Every change in order; click a step to go back (or forward) to it")
+        self.tabs.addTab(self.history, "History")
         odock = QDockWidget("Overlays", self)
         odock.setObjectName("overlays")
         odock.setWidget(self.tabs)
@@ -371,6 +383,9 @@ class MainWindow(QMainWindow):
         self.zpf_list = QListWidget()
         self.zpf_list.itemChanged.connect(self._on_zpf_toggled)
         addf, addd, rem, clr = QPushButton("Files…"), QPushButton("Folder…"), QPushButton("Remove"), QPushButton("Clear")
+        save_marked = QPushButton("Save marked points…")
+        save_marked.setToolTip("Write the points marked with right-click ▸ Mark data point here as ESPEI ZPF datasets")
+        save_marked.clicked.connect(self.save_marked)
         addf.clicked.connect(self.add_zpf_files)
         addd.clicked.connect(self.add_zpf_folder)
         rem.clicked.connect(self.remove_zpf)
@@ -385,13 +400,23 @@ class MainWindow(QMainWindow):
         row = QHBoxLayout()
         for b in (addf, addd, rem, clr):
             row.addWidget(b)
+        row2 = QHBoxLayout()
+        row2.addWidget(save_marked)
+        row2.addStretch(1)
         trow = QHBoxLayout()
         trow.addWidget(QLabel("Ternary: show data within ±"))
         trow.addWidget(self.zpf_tol)
+        self.zpf_misfit_cb = QCheckBox("Outline points by misfit")
+        self.zpf_misfit_cb.setChecked(True)
+        self.zpf_misfit_cb.setToolTip("Fill: the phase. Outline: the largest driving force of the point's tie-line with the current parameters "
+                                      "(green = fits, red = 1000 J/mol or more off; thicker = worse)")
+        self.zpf_misfit_cb.toggled.connect(lambda *_: self.replot())
         lay = QVBoxLayout(w)
         lay.addLayout(row)
+        lay.addLayout(row2)
         lay.addWidget(self.zpf_list, 2)
         lay.addLayout(trow)
+        lay.addWidget(self.zpf_misfit_cb)
         lay.addWidget(QLabel("Temperatures in the data (double-click to map that section):"))
         lay.addWidget(self.zpf_temps, 1)
         lay.addWidget(self.map_picked_btn)
@@ -440,6 +465,7 @@ class MainWindow(QMainWindow):
         self._act(vm, "Check for Artifacts", self.check_artifacts)
         self._act(vm, "Export Figure…", self.export_figure)
         hm = mb.addMenu("&Help")
+        self._act(hm, "Open Log Folder", self.open_log_folder)
         self._act(hm, "About", lambda: QMessageBox.about(
             self, "tdb-tweak", f"tdb-tweak {__version__}\n\nHand-tune TDB parameters against a pycalphad map.\n"
                                f"Column generation available: {'yes' if cg_available() else 'no'}"))
@@ -744,7 +770,8 @@ class MainWindow(QMainWindow):
             "tstep": self.tstep.value() * (5 / 9 if self.t_unit.currentText() == "°F" else 1.0),
             "tsec_K": self._T_K(self.tsec), "xmin": self.xmin.value(), "xmax": self.xmax.value(),
             "xstep": self.xstep.value(), "ymin": self.ymin.value(), "ymax": self.ymax.value(),
-            "fixed": self.fixed.value(), "pdens": self.pdens.value(), "cg": bool(self.solver.currentData()),
+            "fixed": self.fixed.value(), "pdens": self.pdens.value(), "solver": self.solver.currentData(),
+            "cg": self.solver.currentData() == "cg",
             "tielines": self.tielines.isChecked(),
         }
 
@@ -772,7 +799,10 @@ class MainWindow(QMainWindow):
                 if name in g:
                     getattr(self, name).setValue(g[name])
             self.pdens.setValue(g.get("pdens", 500))
-            self.solver.setCurrentIndex(1 if g.get("cg") and cg_available() else 0)
+            sv = g.get("solver") or ("cg" if g.get("cg") else "pycalphad")
+            if not cg_available() and sv in ("cg", "auto"):
+                sv = "pycalphad"
+            self.solver.setCurrentIndex(max(0, self.solver.findData(sv)))
             self.tielines.setChecked(g.get("tielines", g.get("kind") == "ternary"))
         finally:
             for w in widgets:
@@ -799,7 +829,9 @@ class MainWindow(QMainWindow):
                          tmin=g["tmin_K"], tmax=g["tmax_K"], tstep=g["tstep"], temperature=g["tsec_K"],
                          xmin=g["xmin"] / 100, xmax=g["xmax"] / 100, xstep=g["xstep"] / 100,
                          ymin=g["ymin"] / 100, ymax=g["ymax"] / 100, fixed=g["fixed"] / 100,
-                         use_cg=bool(g.get("cg")), global_min_pdens=int(g.get("pdens", 500)))
+                         use_cg=(g.get("solver") == "cg") or (bool(g.get("cg")) and not g.get("solver")),
+                         solver="auto" if g.get("solver") == "auto" else "",
+                         global_min_pdens=int(g.get("pdens", 500)))
         if k == "isopleth" and req.xmax + req.fixed > 1:
             req.xmax = 1 - req.fixed
         return req, ""
@@ -862,7 +894,8 @@ class MainWindow(QMainWindow):
                                                        (len(q) > 2 and q[2] is not None) == ghost)]
         self._pending = (key, stamp, label, req, from_queue, values if ghost else None, text)
         self._map_started = time.perf_counter()
-        self.runner.submit(text, list(values.keys()), values, req, zpf=self.zpf, warm=fast and not ghost)
+        self.runner.submit(text, list(values.keys()), values, req, zpf=self.zpf, warm=fast and not ghost,
+                           thermo=self.thermo)
         self.cancel_btn.setEnabled(True)
         self.state_lbl.setText(f"<span style='color:#0a58ca'>● mapping{' ' + label if label else ''}…</span>")
         self._refresh_view_buttons()
@@ -902,6 +935,11 @@ class MainWindow(QMainWindow):
             (" (fast)" if getattr(res, "warm", False) else "")
         if res.zpf is not None and res.zpf.n:
             msg += f"  ·  {res.zpf.text()}"
+        if getattr(res, "thermo", None) is not None and res.thermo.n:
+            msg += f"  ·  {res.thermo.text()}"
+            ckt = self._ghost_result(res.request)
+            if ckt is not None and getattr(ckt, "thermo", None) is not None and ckt.thermo.n:
+                msg += f" ({ckt.thermo.rms:.2g}σ)"
             ck = self._ghost_result(res.request)
             if ck is not None and ck.zpf is not None and ck.zpf.n:
                 src = self._ghost_source(res.request)
@@ -915,7 +953,7 @@ class MainWindow(QMainWindow):
             self.replot()
             self.opt.refresh_invariants()
             self._queue_ghost(res.request)
-            if res.zpf is not None:
+            if res.zpf is not None or getattr(res, "thermo", None) is not None:
                 self._refresh_zpf_list()
                 self.state_lbl.setToolTip("Worst ZPF points (driving force, J/mol):\n" + "\n".join(
                     f"{a:8.0f}  {b}" for a, b in res.zpf.worst[:6]))
@@ -984,6 +1022,41 @@ class MainWindow(QMainWindow):
         if skipped:
             self.statusBar().showMessage("Not shown (units differ from the diagram's): " + ", ".join(skipped), 8000)
         return out
+
+    # ----------------------------------------------------------------------------------- marked data points
+    def mark_point(self, T: float, comp: Dict[str, float], phase: str, partner: str):
+        """A data point marked by hand (e.g. read off a literature image): phase at this composition in
+        equilibrium with partner (its composition unknown). Collected in the "Marked points" dataset."""
+        from .espei_export import add_mark
+        els = tuple(sorted(self.diagram_elements()))
+        ds = next((d for d in self.zpf if getattr(d, "marked", False) and tuple(sorted(d.elements)) == els), None)
+        if ds is None:
+            ds = ZPFDataset(f"marked-points-{'-'.join(els)} (unsaved)", list(els), [], "Marked points",
+                            "Marked by hand in tdb-tweak")
+            ds.marked = True
+            self.zpf.append(ds)
+        add_mark(ds, T, phase, comp, partner)
+        self._log(f"marked: {phase} (+{partner}) at {T:.6g} K, " +
+                  ", ".join(f"x({e})={v:.4f}" for e, v in comp.items()))
+        self._refresh_zpf_list()
+        self._zpf_changed()
+
+    def save_marked(self):
+        from .espei_export import marked_to_dict, write
+        marked = [d for d in self.zpf if getattr(d, "marked", False)]
+        if not marked:
+            QMessageBox.information(self, "Marked points", "No marked points yet: right-click on the diagram ▸ "
+                                    "Mark data point here.")
+            return
+        folder = QFileDialog.getExistingDirectory(self, "Folder for the marked points (ESPEI ZPF datasets)")
+        if not folder:
+            return
+        for d in marked:
+            path = os.path.join(folder, d.path.replace(" (unsaved)", "") + ".json")
+            write(path, marked_to_dict(d))
+            d.path = path
+            self._log(f"saved marked points to {path}")
+        self._refresh_zpf_list()
 
     # ----------------------------------------------------------------------------------- ESPEI MCMC polish
     def espei_polish(self):
@@ -1099,9 +1172,12 @@ class MainWindow(QMainWindow):
         if isinstance(findings, str):
             QMessageBox.warning(self, "Artifact check", findings)
             return
+        from .artifacts import parameter_findings
+        findings = list(findings) + (parameter_findings(self.doc, self.subsystem) if self.doc is not None else [])
         if not findings:
             QMessageBox.information(self, "Artifact check", "No artifacts found: no solid stable at 4000–6000 K, no "
-                                    "high-temperature miscibility gap, no liquid at 300 K.")
+                                    "high-temperature miscibility gap, no liquid at 300 K, no parameter beyond its "
+                                    "per-atom range.")
             return
         for f in findings:
             self._log(f"artifact check ({f.severity}): {f.text}")
@@ -1215,6 +1291,8 @@ class MainWindow(QMainWindow):
             return
         view = self.current_view()
         res = self._result_for_display(view)
+        if self.zpf_misfit_cb.isChecked() and res is not None and getattr(res, "zpf", None) is not None:
+            view.zpf_misfit = res.zpf.per_tieline
         key = (view.kind, view.elements, view.t_unit, view.x_unit, view.temperature if view.kind == "ternary" else 0)
         if self._pending_zoom is not None:                 # a saved view was just applied
             self._zoom = self._pending_zoom[1]
@@ -1464,7 +1542,7 @@ class MainWindow(QMainWindow):
         text = self.doc.compute_text()
         stamp = values_stamp(text, vals)
         for req, label in jobs:
-            fut = self.pool.submit(text, list(vals), vals, req, zpf=self.zpf)
+            fut = self.pool.submit(text, list(vals), vals, req, zpf=self.zpf, thermo=self.thermo)
             self._pool_jobs.append((fut, request_key(req), stamp, label))
         self._pool_total = len(self._pool_jobs)
         self.state_lbl.setText(f"<span style='color:#0a58ca'>● mapping {len(jobs)} views in parallel…</span>")
@@ -1674,25 +1752,39 @@ class MainWindow(QMainWindow):
             self._add_zpf([d])
 
     def _add_zpf(self, paths: List[str]):
+        """Load ESPEI datasets: ZPF data and thermochemical data (fixed-configuration, activities)."""
+        from . import thermo
         ds, msgs = load_paths(paths)
         known = {d.path for d in self.zpf}
         new = [d for d in ds if d.path not in known]
         self.zpf += new
-        for m in msgs:
-            self._log(f"ZPF: {m}")
-        self._log(f"ZPF: loaded {len(new)} datasets")
+        tds, tmsgs = thermo.load_paths(paths)
+        tknown = {d.path for d in self.thermo}
+        tnew = [d for d in tds if d.path not in tknown]
+        self.thermo += tnew
+        for m in msgs + tmsgs:
+            self._log(f"data: {m}")
+        unresolved = sum(1 for d in tnew if d.excluded is None)
+        self._log(f"data: loaded {len(new)} ZPF and {len(tnew)} thermochemical datasets"
+                  + (f" ({unresolved} with tags not defined in an ESPEI input YAML next to the data: skipped)"
+                     if unresolved else ""))
         self._refresh_zpf_list()
         self._zpf_changed()
 
+    def _data_items(self):
+        return [("zpf", d) for d in self.zpf] + [("thermo", d) for d in self.thermo]
+
     def remove_zpf(self):
         i = self.zpf_list.currentRow()
-        if i >= 0:
-            del self.zpf[i]
+        items = self._data_items()
+        if 0 <= i < len(items):
+            kind, d = items[i]
+            (self.zpf if kind == "zpf" else self.thermo).remove(d)
             self._refresh_zpf_list()
-            self.replot()
+            self._zpf_changed()
 
     def clear_zpf(self):
-        self.zpf = []
+        self.zpf, self.thermo = [], []
         self._refresh_zpf_list()
         self.replot()
 
@@ -1700,6 +1792,7 @@ class MainWindow(QMainWindow):
         self.zpf_list.blockSignals(True)
         self.zpf_list.clear()
         score = self.result.zpf if (self.result is not None and getattr(self.result, "zpf", None)) else None
+        tscore = self.result.thermo if (self.result is not None and getattr(self.result, "thermo", None)) else None
         for d in self.zpf:
             n = len(d.tielines)
             txt = f"{d.label}  [{'-'.join(sorted(d.elements))}, {n} tie-lines]"
@@ -1712,11 +1805,26 @@ class MainWindow(QMainWindow):
             it.setToolTip(f"{d.path}\nphases: {', '.join(d.phases)}\n{d.comment}\n"
                           "J/mol: RMS driving force of its points against the current parameters (0 = perfect)")
             self.zpf_list.addItem(it)
+        for d in self.thermo:
+            txt = f"[{d.output}] {d.label}  ({'-'.join(sorted(d.elements))}, {', '.join(d.phases)})"
+            if d.disabled:
+                txt += "  — disabled in the file"
+            elif d.excluded is None:
+                txt += "  — tags unknown, skipped"
+            elif tscore is not None and d.path in tscore.per_dataset:
+                rms, k = tscore.per_dataset[d.path]
+                txt += f"  —  {rms:.2g}σ"
+            it = QListWidgetItem(txt)
+            it.setFlags(it.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+            it.setCheckState(Qt.CheckState.Checked if d.enabled else Qt.CheckState.Unchecked)
+            it.setToolTip(f"{d.path}\n{d.comment}\nσ: RMS of (model − data) / ESPEI's standard deviation "
+                          "(HM 500 J/mol, SM and CPM 0.2 J/mol/K, activities 500 J/mol in μ)")
+            self.zpf_list.addItem(it)
         self.zpf_list.blockSignals(False)
         self._refresh_zpf_temps()
 
     def _on_zpf_toggled(self, item: QListWidgetItem):
-        self.zpf[self.zpf_list.row(item)].enabled = item.checkState() == Qt.CheckState.Checked
+        self._data_items()[self.zpf_list.row(item)][1].enabled = item.checkState() == Qt.CheckState.Checked
         self._refresh_zpf_temps()
         self._zpf_changed()
 
@@ -1762,6 +1870,7 @@ class MainWindow(QMainWindow):
             "views": [v.to_dict() for v in self.views],
             "images": [e.cal.to_dict() for e in self.images],
             "zpf": [{"path": z.path, "enabled": z.enabled} for z in self.zpf],
+            "thermo": [{"path": z.path, "enabled": z.enabled} for z in self.thermo],
             "zpf_tolerance": self.zpf_tol.value(),
             "table": {"sort": self.params.sort_combo.currentIndex(), "nonvv": self.params.show_nonvv.isChecked(),
                       "lower": self.params.show_lower.isChecked()},
@@ -1827,6 +1936,15 @@ class MainWindow(QMainWindow):
             for x in ds:
                 x.enabled = en.get(x.path, True)
             self.zpf = ds
+        self.thermo = []
+        tp = [res(z["path"]) for z in d.get("thermo", [])]
+        if tp:
+            from . import thermo as _thermo
+            tds, _ = _thermo.load_paths([p for p in tp if os.path.exists(p)])
+            ten = {res(z["path"]): z.get("enabled", True) for z in d.get("thermo", [])}
+            for x in tds:
+                x.enabled = ten.get(x.path, True)
+            self.thermo = tds
         self.zpf_tol.setValue(d.get("zpf_tolerance", 5))
         self._refresh_zpf_list()
         if self.doc is not None and d.get("locked"):
@@ -1853,6 +1971,12 @@ class MainWindow(QMainWindow):
     # ===================================================================================== misc
     def _log(self, msg: str):
         self.log.appendPlainText(time.strftime("%H:%M:%S  ") + msg)
+        _file_log(msg)
+
+    def open_log_folder(self):
+        from PyQt6.QtCore import QUrl
+        from PyQt6.QtGui import QDesktopServices
+        QDesktopServices.openUrl(QUrl.fromLocalFile(os.path.dirname(self.session_path())))
 
     def closeEvent(self, ev):
         if not self._confirm_discard():
@@ -1865,9 +1989,43 @@ class MainWindow(QMainWindow):
         super().closeEvent(ev)
 
 
+def log_path() -> str:
+    return os.path.join(os.path.dirname(MainWindow.session_path()), "tdb-tweak.log")
+
+
+def _file_log(msg: str):
+    try:
+        p = log_path()
+        if os.path.exists(p) and os.path.getsize(p) > 2_000_000:        # keep the log small
+            os.replace(p, p + ".old")
+        with open(p, "a", encoding="utf-8") as f:
+            f.write(time.strftime("%Y-%m-%d %H:%M:%S  ") + msg + "\n")
+    except Exception:
+        pass
+
+
+def _install_excepthook():
+    """Uncaught errors go to the log file and a message box (there is no console with pythonw on Windows)."""
+    import traceback
+
+    def hook(etype, value, tb):
+        text = "".join(traceback.format_exception(etype, value, tb))
+        _file_log("UNCAUGHT ERROR\n" + text)
+        try:
+            QMessageBox.critical(None, "tdb-tweak error",
+                                 f"{etype.__name__}: {value}\n\nDetails are in {log_path()} "
+                                 f"(Help ▸ Open Log Folder).")
+        except Exception:
+            pass
+    sys.excepthook = hook
+
+
 def main(argv=None):
     argv = list(sys.argv if argv is None else argv)
     app = QApplication(argv)
+    app.setOrganizationName("tdb-tweak")
+    _install_excepthook()
+    _file_log(f"start (Python {sys.version.split()[0]}, {sys.platform})")
     app.setApplicationName("tdb-tweak")
     w = MainWindow()
     w.show()

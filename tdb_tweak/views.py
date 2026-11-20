@@ -29,7 +29,7 @@ class SavedView:
 
 def same_diagram(a: Dict, b: Dict) -> bool:
     """True when two diagram settings describe the same diagram (floats compared with a tolerance)."""
-    for k in ("kind", "t_unit", "x_unit", "cg", "pdens"):
+    for k in ("kind", "t_unit", "x_unit", "cg", "solver", "pdens"):
         if a.get(k) != b.get(k):
             return False
     n = 2 if a.get("kind") == "binary" else 3

@@ -50,6 +50,7 @@ class Variable:
     basis: str                      # const / T / TLNT / ...
     label: str = ""
     limit_override: Optional[float] = None   # absolute max change per iteration
+    atoms: float = 1.0                       # atoms per formula unit of its phase (sanity range per atom)
 
 
 @dataclass
@@ -65,6 +66,8 @@ class InvariantTarget:
     corners_guess: Dict[str, Tuple[float, ...]] = field(default_factory=dict)   # phase -> current composition
     req: Optional[MapRequest] = None         # the diagram this target belongs to (None: the run's request)
     hold: bool = False                       # added automatically to hold a feature in place
+    point: Optional[Tuple[float, float]] = None       # ternary boundary node: (xB, xC) the boundary should pass
+    direction: Optional[Tuple[float, float]] = None   # ... and the tie-line direction there (boundary → partner)
 
 
 @dataclass
@@ -81,6 +84,7 @@ class OptSettings:
     max_total: float = 5.0                   # a parameter moves at most this many per-iteration limits per run
     hold_others: bool = False                # hold every other feature of the targets' diagrams in place
     reject_artifacts: bool = True            # reject steps that create new artifacts (artifacts.scan)
+    jacobian_only: bool = False              # only linearise at the current values (live drag); no iterations
     fit_zpf: bool = False                    # also minimise the driving forces of ZPF data
     zpf_sigma: float = 1000.0                # J/mol per data point (ESPEI's default ZPF uncertainty)
     zpf_data: list = field(default_factory=list)
@@ -119,6 +123,7 @@ class OptResult:
     variables: List[Variable]
     holds: List[InvariantTarget] = field(default_factory=list)
     artifacts: List = field(default_factory=list)          # artifacts.Finding after the run
+    linear: Optional[Dict] = None                          # jacobian_only: the linear model (see linear_step)
 
     @property
     def target(self) -> InvariantTarget:
@@ -384,6 +389,64 @@ class _Boundary:
         self.css = out[2]
 
 
+class _TernaryBoundary:
+    """A ternary two-phase boundary point at fixed T.
+
+    The node is a point p on the boundary of phase α (partner β); d is the unit tie-line direction from α to β.
+    The two-phase equilibrium at the overall composition p + f·L·d (a short way into the two-phase region) gives the
+    tie line through it; its α end is where the boundary is near p.  The residual is how far that end lies from p
+    along d (zero when the boundary passes through p).  Only ordinary overall conditions are used, so this also
+    works across one phase's miscibility gap."""
+
+    def __init__(self, node, elements: Sequence[str], T: float, point, direction, length: float):
+        self.names = list(node.stable_phases_with_multiplicity)
+        self.css0 = copy.deepcopy(node.stable_composition_sets)
+        self.css = copy.deepcopy(self.css0)
+        self.els = sorted(elements)
+        self.B, self.C = elements[1], elements[2]
+        self.T = float(T)
+        self.p = np.asarray(point, dtype=float)
+        d = np.asarray(direction, dtype=float)
+        self.d = d / max(np.linalg.norm(d), 1e-12)
+        self.step = max(0.2 * float(length), 0.002)
+
+    def solve(self, start=None):
+        css = copy.deepcopy(start if start is not None else self.css)
+        x0 = self.p + self.step * self.d
+        for c in css:
+            c.fixed = False
+            map_utils.update_cs_phase_frac(c, 0.5)
+        conds = {v.P: np.array(101325.0), v.N: np.array(1.0), v.T: np.array(self.T),
+                 v.X(self.B): np.array([float(x0[0])]), v.X(self.C): np.array([float(x0[1])])}
+        try:
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                res = Solver(remove_metastable=False).solve(css, conds)
+        except Exception:
+            return None
+        if not res.converged or any(float(c.NP) < -1e-6 for c in css):
+            return None
+        x, pts = {}, []
+        for n, c in zip(self.names, css):
+            X = np.asarray(c.X)
+            b, cc = float(X[self.els.index(self.B)]), float(X[self.els.index(self.C)])
+            x[f"{n}|{self.B}"], x[f"{n}|{self.C}"] = b, cc
+            pts.append(np.array([b, cc]))
+        if np.linalg.norm(pts[0] - pts[1]) < 1e-6:
+            return None
+        x[f"{self.names[0]}|across"] = float(pts[0] @ self.d)
+        return self.T, x, css, conds, np.array(res.chemical_potentials)
+
+    def solve_robust(self):
+        out = self.solve()
+        if out is None:
+            out = self.solve(self.css0)
+        return out
+
+    def accept(self, out):
+        self.css = out[2]
+
+
 def _features(strategy, rq: MapRequest, models) -> List[InvariantTarget]:
     """Every invariant / congruent point (binary) or tie triangle (ternary) of a map, at its current values."""
     from .points import composition_space, detect_congruent
@@ -459,8 +522,9 @@ def optimize_invariant(engine: Engine, req: MapRequest, values: Dict[str, float]
             t.req = req
         if t.T_target is None and not any(xv is not None for xv in t.x_target.values()):
             raise ValueError(f"{target_label(t)}: tick at least one target value (temperature or a composition)")
-        if (t.kind == "tietriangle") != (t.req.kind == "ternary") or t.req.kind not in ("binary", "ternary"):
-            raise ValueError(f"{target_label(t)}: tie triangles belong to ternary sections, the others to binaries")
+        ok = {"tietriangle": ("ternary",), "boundary": ("binary", "ternary")}.get(t.kind, ("binary",))
+        if t.req.kind not in ok:
+            raise ValueError(f"{target_label(t)}: this kind of target belongs to a {' or '.join(ok)} diagram")
     values = dict(values)
     names = [var.name for var in variables]
     missing = [n for n in names if n not in values]
@@ -505,6 +569,12 @@ def optimize_invariant(engine: Engine, req: MapRequest, values: Dict[str, float]
             cand = min(cands, key=lambda c: abs(c[3] - t.T_guess) / 100 + abs(c[2] - t.x_guess))
             got = solve_congruent_from_line(*cand, A, B, models)
             return None if got is None else _CongruentPoint(got[0], got[1][1], got[1][0], B)
+        if t.kind == "boundary" and rq.kind == "ternary":
+            node = states_from_compositions(engine, comps, models, prf, t.phases, t.corners_guess,
+                                            rq.elements[1:], rq.temperature)
+            a, b = t.corners_guess[t.phases[0]], t.corners_guess[t.phases[1]]
+            return _TernaryBoundary(node, rq.elements, rq.temperature, t.point, t.direction,
+                                    float(np.hypot(b[0] - a[0], b[1] - a[1])))
         if t.kind == "boundary":
             node = states_from_compositions(engine, comps, models, prf, t.phases, t.corners_guess, [B], t.T_target)
             return _Boundary(node, sorted([A, B]).index(B), B, t.T_target)
@@ -550,7 +620,7 @@ def optimize_invariant(engine: Engine, req: MapRequest, values: Dict[str, float]
     def data_dfs(vals):
         out = []
         for rq in data_reqs.values():
-            out += [d for _, _, d in driving_forces(engine, rq, vals, settings.zpf_data)]
+            out += [d for _, _, d, _ in driving_forces(engine, rq, vals, settings.zpf_data)]
         set_values(vals)
         return np.array(out, dtype=float)
 
@@ -645,8 +715,11 @@ def optimize_invariant(engine: Engine, req: MapRequest, values: Dict[str, float]
 
     from .artifacts import scan as _scan
 
+    from .artifacts import too_large
+
     def artifacts(vals):
-        found = set()
+        found = {f"{var.name} beyond its per-atom range" for var in variables
+                 if too_large(vals[var.name], var.basis, var.atoms)}
         for rq in data_reqs.values():
             found |= {f.text.split(" (")[0] for f in _scan(engine, rq.elements, vals, phases=rq.phases)
                       if f.severity == "warning"}
@@ -660,6 +733,32 @@ def optimize_invariant(engine: Engine, req: MapRequest, values: Dict[str, float]
                          norm=float(np.sum(((p - centre) / floors) ** 2)), zpf_rms=zrms(cur))]
     if progress:
         progress(hist[-1])
+    if settings.jacobian_only:
+        lim = np.array([limit_for(var, pv, settings) for var, pv in zip(variables, p)])
+        J = np.zeros((len(r), len(p)))
+        for j in range(len(p)):
+            h = settings.fd_fraction * lim[j]
+            trial = dict(values)
+            trial[names[j]] = p[j] + h
+            out = evaluate(trial)
+            if out is None:
+                trial[names[j]] = p[j] - h
+                out = evaluate(trial)
+                h = -h
+            if out is not None:
+                J[:, j] = (residuals(out) - r) / (h / lim[j])
+        set_values(values)
+        rows = []                                     # (target index, "T" or x key, tolerance, target value)
+        for ti, t in enumerate(all_targets):
+            if t.T_target is not None and t.kind != "boundary":
+                rows.append((ti, "T", t.T_tol, float(t.T_target)))
+            for k, xt in t.x_target.items():
+                if xt is not None:
+                    rows.append((ti, k, t.x_tol, float(xt)))
+        linear = dict(names=names, p0=p.copy(), lim=lim, J=J, r0=r.copy(), rows=rows, n_user=len(targets),
+                      floors=floors, centre=centre, wn=wn, max_total=settings.max_total)
+        return OptResult(hist, True, "linearised", time.perf_counter() - t0, targets, list(variables), holds,
+                         linear=linear)
     lam = 1e-3
     converged = target_max(r) <= 1.0
     message = "already within tolerance" if converged else ""
@@ -788,3 +887,32 @@ def optimize_invariant(engine: Engine, req: MapRequest, values: Dict[str, float]
     if holds:
         message += f" — {len(holds)} other features held"
     return OptResult(hist, converged, message, time.perf_counter() - t0, targets, list(variables), holds)
+
+
+def linear_step(lin: Dict, wanted: Dict[Tuple[int, str], float]):
+    """Parameters for new wanted target values from the linear model of a live drag (microseconds).
+
+    ``wanted`` maps (target index, "T" or x key) to its new value; rows not given keep their original target.
+    Returns (parameter values {name: value}, predicted target quantities {(target index, key): value})."""
+    J, r0, rows = lin["J"], lin["r0"].copy(), lin["rows"]
+    for i, (ti, key, tol, t0) in enumerate(rows):
+        if (ti, key) in wanted:
+            r0[i] += (t0 - wanted[(ti, key)]) / tol
+    n = J.shape[1]
+    A, b = J, -r0
+    if lin["wn"]:
+        D = np.diag(lin["wn"] * lin["lim"] / lin["floors"])
+        n0 = lin["wn"] * (lin["p0"] - lin["centre"]) / lin["floors"]
+        A = np.vstack([J, D])
+        b = np.concatenate([-r0, -n0])
+    AtA = A.T @ A
+    u = np.linalg.solve(AtA + 1e-6 * max(np.trace(AtA) / max(n, 1), 1e-12) * np.eye(n), A.T @ b)
+    m = float(np.max(np.abs(u))) if n else 0.0
+    if m > lin["max_total"]:
+        u *= lin["max_total"] / m
+    p = lin["p0"] + u * lin["lim"]
+    pred_r = lin["r0"] + J @ u
+    predicted = {}
+    for i, (ti, key, tol, t0) in enumerate(rows):
+        predicted[(ti, key)] = t0 + pred_r[i] * tol          # the quantity itself (target + residual × tol)
+    return dict(zip(lin["names"], p.tolist())), predicted

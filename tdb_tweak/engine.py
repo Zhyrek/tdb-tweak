@@ -97,6 +97,7 @@ class MapRequest:
     fixed: float = 0.1                         # isopleth: X(C)
     pressure: float = 101325.0
     use_cg: bool = False
+    solver: str = ""                           # "auto": time both solvers now and then, use the faster
     global_min_pdens: int = 500
     global_check_interval: int = 1
 
@@ -108,6 +109,7 @@ class Boundary:
     y: np.ndarray
     partner: str = ""                          # the other phase of the two-phase region (tie-line strategies)
     partner_x: Optional[np.ndarray] = None     # its x at the same points (binary: composition; ternary: X(B))
+    partner_y: Optional[np.ndarray] = None     # ternary: its X(C) at the same points
 
 
 @dataclass
@@ -119,6 +121,7 @@ class MapResult:
     congruent: List = field(default_factory=list)                       # points.CongruentPoint (binary)
     phase_space: Dict = field(default_factory=dict)                     # phase -> points.composition_space
     zpf: Optional[object] = None                                        # zpfscore.ZPFScore of the loaded data
+    thermo: Optional[object] = None                                     # thermo.ThermoScore of thermochemical data
     warm: bool = False                          # started from the previous map's starting points (fast redraw)
     complete: bool = False
     seconds: float = 0.0
@@ -196,9 +199,45 @@ class Engine:
         from dataclasses import asdict
         return tuple(sorted((k, tuple(v_) if isinstance(v_, list) else v_) for k, v_ in asdict(req).items()))
 
+    RECHECK_EVERY = 30
+
     def run(self, req: MapRequest, values: Dict[str, float], cancel: Optional[threading.Event] = None,
             progress: Optional[Callable[[MapResult], None]] = None, progress_interval: float = 0.4,
             warm: bool = False) -> MapResult:
+        """Map ``req``; with ``req.solver == "auto"`` the faster of pycalphad's solver and column generation is used
+        (both are timed on the first map of a diagram and every RECHECK_EVERY maps after)."""
+        if req.solver != "auto" or _cg is None:
+            from dataclasses import replace
+            return self._run(replace(req, solver="", use_cg=req.use_cg and _cg is not None), values, cancel,
+                             progress, progress_interval, warm)
+        from dataclasses import replace
+        if not hasattr(self, "_solver_pick"):
+            self._solver_pick = {}
+        key = self._req_key(replace(req, solver="", use_cg=False, temperature=0.0))
+        pick = self._solver_pick.get(key)
+        if pick is None or (pick[1] >= self.RECHECK_EVERY and not warm):
+            times, results = {}, {}
+            for cg in (False, True):
+                r = self._run(replace(req, solver="", use_cg=cg), values, cancel, progress if not cg else None,
+                              progress_interval, warm)
+                times[cg], results[cg] = r.seconds, r
+            best = min(times, key=times.get)
+            self._solver_pick[key] = [best, 0]
+            res = results[best]
+            res.message = (res.message + "; " if res.message else "") + \
+                f"auto: {'column generation' if best else 'pycalphad'} " \
+                f"({times[True]:.2f} s cg vs {times[False]:.2f} s pycalphad)"
+            res.request = req
+            return res
+        pick[1] += 1
+        res = self._run(replace(req, solver="", use_cg=pick[0]), values, cancel, progress, progress_interval, warm)
+        res.message = (res.message + "; " if res.message else "") + ("auto: cg" if pick[0] else "auto: pycalphad")
+        res.request = req
+        return res
+
+    def _run(self, req: MapRequest, values: Dict[str, float], cancel: Optional[threading.Event] = None,
+             progress: Optional[Callable[[MapResult], None]] = None, progress_interval: float = 0.4,
+             warm: bool = False) -> MapResult:
         """Map ``req``.  ``warm``: start from the previous full map's starting points instead of searching the
         axis edges again (about 35-55 % faster; a phase region not connected to any of them would be missed)."""
         if self.dbf is None:
@@ -423,7 +462,7 @@ class Engine:
                 if len(phs) == 2:
                     for k in (0, 1):
                         bnd = res.boundaries[-2 + k]
-                        bnd.partner, bnd.partner_x = phs[1 - k], pts[1 - k][0]
+                        bnd.partner, bnd.partner_x, bnd.partner_y = phs[1 - k], pts[1 - k][0], pts[1 - k][1]
                 if len(pts) == 2:
                     res.tielines.append(np.stack([np.stack([pts[0][0], pts[0][1]], -1),
                                                   np.stack([pts[1][0], pts[1][1]], -1)], axis=1))

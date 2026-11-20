@@ -72,17 +72,25 @@ def new_entry(item: Dict) -> Dict:
     fixed = set(fixed_phases(e))
     if item["kind"] == "congruent":
         keys = [] if item.get("fixed_x") else [item["names"][0]]
+    elif item["kind"] == "boundary" and item.get("direction") is not None:      # ternary boundary node
+        els = item["elements"]
+        keys = [f"node|{els[1]}", f"node|{els[2]}"]
+        e["cur_x"] = dict(item["cur_x"])
+        e["cur_x"][f"node|{els[1]}"] = item["cur_x"][f"{item['names'][0]}|{els[1]}"]
+        e["cur_x"][f"node|{els[2]}"] = item["cur_x"][f"{item['names'][0]}|{els[2]}"]
     elif item["kind"] == "boundary":
         keys = [item["names"][0]]
     else:
         keys = [k for k in item["cur_x"] if k.split("|")[0] not in fixed]
-    e["want_x"] = {k: float(item["cur_x"][k]) for k in keys}
+    e["want_x"] = {k: float(e["cur_x"][k] if k in e.get("cur_x", {}) else item["cur_x"][k]) for k in keys}
     e["use_T"] = item["kind"] != "tietriangle"
     e["use_x"] = {k: True for k in keys}
     return e
 
 
 def key_label(e: Dict, k: str) -> str:
+    if k.startswith("node|"):
+        return f"node x {k.split('|')[1].capitalize()}"
     if e["kind"] == "boundary":
         return f"x({k}) at that T"
     if e["kind"] == "congruent":
@@ -151,6 +159,10 @@ class OptPanel(QWidget):
         clr.clicked.connect(self.clearRequested)
         rm_row.addWidget(rm)
         rm_row.addWidget(clr)
+        self.export_btn = QPushButton("Export as ESPEI data…")
+        self.export_btn.setToolTip("Write the targets (at their wanted positions) as ESPEI ZPF datasets, one per system "
+                                   "(first version)")
+        rm_row.addWidget(self.export_btn)
         tol = QHBoxLayout()
         self.t_tol = _dspin(0.001, 500, 1.0, 3, 0.5, " K")
         self.x_tol = _dspin(0.0001, 10, 0.1, 4, 0.05, " at.%")
@@ -255,10 +267,21 @@ class OptPanel(QWidget):
         dr.addWidget(self.fit_zpf)
         dr.addWidget(self.reject_art)
         dr.addStretch(1)
+        self.live = QCheckBox("Live drag: parameters follow the handle")
+        self.live.setChecked(True)
+        self.live.setToolTip("Pressing a handle computes how every target responds to every chosen parameter (about a "
+                             "second); while dragging, the parameters follow from that linear model in microseconds "
+                             "and the filled dots show where the feature is predicted to be. Within about one "
+                             "per-iteration limit of change it is accurate; beyond, the dots stop following: release "
+                             "and press again. One undo step per drag.")
+        dr2 = QHBoxLayout()
+        dr2.addWidget(self.live)
+        dr2.addStretch(1)
         hr.addWidget(QLabel("Total change ≤"))
         hr.addWidget(self.max_total)
         l2.addLayout(hr)
         l2.addLayout(dr)
+        l2.addLayout(dr2)
         lay.addWidget(g2)
 
         # --- run + history ---
@@ -327,7 +350,7 @@ class OptPanel(QWidget):
         meta = []
         for i, e in enumerate(entries):
             meta.append((i, "head"))
-            if e["kind"] != "tietriangle":
+            if e["kind"] != "tietriangle" and len(e.get("elements", [])) != 3:
                 meta.append((i, "T"))
             for k in e["want_x"]:
                 meta.append((i, k))
@@ -419,9 +442,20 @@ class OptPanel(QWidget):
             if e["kind"] == "tietriangle":
                 els = e["elements"]
                 corners = {n: (cx[f"{n}|{els[1]}"], cx[f"{n}|{els[2]}"]) for n in e["names"]}
-            elif e["kind"] in ("invariant", "boundary"):
+            elif e["kind"] in ("invariant", "boundary") and e.get("direction") is None:
                 corners = {n: (cx[n],) for n in e["names"]}
-            if e["kind"] == "boundary":
+            point = direction = None
+            x_target = {k: (v if e["use_x"][k] else None) for k, v in e["want_x"].items()}
+            if e["kind"] == "boundary" and e.get("direction") is not None:              # ternary boundary node
+                els = e["elements"]
+                a, b = e["names"]
+                point = (e["want_x"][f"node|{els[1]}"], e["want_x"][f"node|{els[2]}"])
+                direction = tuple(e["direction"])
+                use = e["use_x"].get(f"node|{els[1]}", True) or e["use_x"].get(f"node|{els[2]}", True)
+                x_target = {f"{a}|across": float(np.dot(point, direction)) if use else None}
+                corners = {a: (cx[f"{a}|{els[1]}"], cx[f"{a}|{els[2]}"]), b: (cx[f"{b}|{els[1]}"], cx[f"{b}|{els[2]}"])}
+                T_target = None
+            elif e["kind"] == "boundary":
                 T_target = e["want_T"]                      # where the boundary is evaluated (a condition)
             elif e["kind"] == "tietriangle":
                 T_target = None
@@ -429,9 +463,10 @@ class OptPanel(QWidget):
                 T_target = e["want_T"] if e["use_T"] else None
             out.append(InvariantTarget(
                 tuple(e["names"]), float(e["T"]), T_target=T_target,
-                x_target={k: (v if e["use_x"][k] else None) for k, v in e["want_x"].items()},
+                x_target=x_target,
                 T_tol=self.t_tol.value(), x_tol=self.x_tol.value() / 100, kind=e["kind"],
-                x_guess=float(next(iter(cx.values()))) if cx else 0.5, corners_guess=corners, req=e.get("req")))
+                x_guess=float(next(iter(cx.values()))) if cx else 0.5, corners_guess=corners, req=e.get("req"),
+                point=point, direction=direction))
         return out
 
     # ----------------------------------------------------------------------------------------- variables

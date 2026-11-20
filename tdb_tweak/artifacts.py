@@ -122,3 +122,33 @@ def scan(engine, elements: Sequence[str], values: Dict[str, float], phases=None,
             out.append(Finding("note", f"the liquid is stable at {LOW_T:.0f} K ({where(comp)})"))
             break
     return out
+
+
+# ---------------------------------------------------------------------------------------------------------
+# parameter magnitudes, per atom of the formula unit
+# ---------------------------------------------------------------------------------------------------------
+PER_ATOM_LIMIT = {"const": 400e3, "T": 100.0, "TLNT": 20.0, "T2": 0.05, "T3": 1e-5, "TINV": 1e7}
+UNITS = {"const": "J/mol", "T": "J/mol/K", "TLNT": "J/mol/K", "T2": "J/mol/K²", "T3": "J/mol/K³", "TINV": "J·K/mol"}
+
+
+def too_large(value: float, basis: str, atoms: float) -> bool:
+    lim = PER_ATOM_LIMIT.get(basis)
+    return lim is not None and abs(value) / max(atoms, 1e-9) > lim
+
+
+def parameter_findings(doc, elements) -> List[Finding]:
+    """Coefficients unusually large for the size of their phase's formula unit."""
+    out, seen = [], set()
+    for r in doc.rows_in(elements):
+        if r.pname is None:
+            continue
+        val = doc.value(r) * (r.multiplier if r.kind == "VV" else 1.0)
+        atoms = doc.phase_atoms(r.phase)
+        if too_large(val, r.basis, atoms) and (r.symbol, r.basis) not in seen:
+            seen.add((r.symbol, r.basis))
+            lim = PER_ATOM_LIMIT[r.basis]
+            out.append(Finding("warning", f"{(r.symbol + ' ') if r.kind == 'VV' else ''}{r.meaning()} = "
+                                          f"{val:.4g} {UNITS[r.basis]}: {abs(val) / atoms:.3g} per atom "
+                                          f"({atoms:g} atoms per formula unit) is beyond the usual "
+                                          f"{lim:g} {UNITS[r.basis]}"))
+    return out

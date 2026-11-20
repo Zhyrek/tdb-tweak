@@ -15,8 +15,9 @@ system:
 | Linux | `tdb-tweak.sh` (`./tdb-tweak.sh --desktop` adds a menu entry) |
 
 The first run creates a private environment (`.venv`) next to the launcher and installs everything, which takes a
-few minutes and needs internet. Later runs start the program directly. `--reinstall` repeats the installation. On
-Windows the program runs without a console window.
+few minutes and needs internet. Later runs start the program directly. `--update` pulls the latest version first
+(for a git clone) and `--reinstall` repeats the installation. On Windows the program runs without a console window.
+Errors are written to `tdb-tweak.log`; Help ▸ Open Log Folder opens its folder.
 
 By hand:
 
@@ -58,6 +59,8 @@ Run the tests with `.venv/bin/python -m pytest`.
   * **Lower-order parameters** are unaries and binaries in a ternary set. They are red, because changing one also
     changes every subsystem that contains it. A toggle hides them.
   * **Non-VV coefficients** shows the plain numbers in PARAMETER expressions so they can be edited too.
+  * **History** tab: every change in order, including nudges, optimizer runs, live drags and ESPEI polishes. Click a
+    step to go back or forward to it.
   * **Locks.** Right-click rows ▸ Lock (or Ctrl+L) to stop a value from being edited, nudged or varied by the
     optimizer; locked rows show 🔒 and are grey. "Lock every <phase> parameter" locks a whole phase. Locks are shared
     with the optimizer's phase tick boxes and saved in the project.
@@ -82,11 +85,16 @@ Run the tests with `.venv/bin/python -m pytest`.
     * a solid stable at 4000–6000 K;
     * a liquid miscibility gap at those temperatures;
     * a phase that on its own has a miscibility gap at 3000 or 5000 K (an inverted gap);
-    * the liquid stable at 300 K, reported as a note.
+    * the liquid stable at 300 K, reported as a note;
+    * **parameters beyond their usual range per atom of the formula unit**, so that a 30-atom phase may carry a
+      300 kJ/mol term: a 400 kJ/mol, b 100 J/mol/K, c 20, d 0.05, e 1e-5, f 1e7 per atom. The optimizer also
+      rejects steps that push a parameter past its range.
     The scan also runs automatically after every optimization.
   * **Global-min pdens** is the sampling density of mapping's global-minimum check, which takes most of the mapping
     time. Lowering it is faster but can miss phases.
-  * **Solver** switches between pycalphad's solver and column generation.
+  * **Solver:** pycalphad's solver, column generation, or **auto (fastest)**, the default when pycalphad-cg is
+    installed. Auto times both solvers on the first map of a diagram and every 30 maps after, and uses the faster.
+    On Cu-Mg it chose column generation (0.63 s vs 0.78 s).
 * **Views bar (under the diagram controls).** A row of buttons, one per saved diagram, for the diagrams you keep
   coming back to (e.g. a zoomed binary region, the 1273 K and 1473 K sections, an isopleth), as opposed to a
   temperature you just want a quick look at.
@@ -129,6 +137,19 @@ Run the tests with `.venv/bin/python -m pytest`.
       * each vertex's driving force is its phase's distance from that hyperplane;
       * the score is the RMS in J/mol, where 0 is a perfect fit.
       Each dataset in the list shows its own score, and the status-line tooltip lists the worst points.
+    * **Misfit outlines:** each data point's fill is its phase colour, and its outline shows its tie-line's largest
+      driving force with the current parameters: green when it fits, red from 1000 J/mol (ESPEI's ZPF uncertainty),
+      and thicker the worse it is. The tie-line's value is used because its misfit often sits on a vertex that isn't
+      drawn: in a liquidus dataset, the solid whose composition is unknown.
+  * **Thermochemical data:** loading a datasets folder also loads ESPEI's non-ZPF data, scored the way ESPEI does.
+    * **Fixed-configuration HM/SM/CPM `_MIX` and `_FORM`:** `_FORM` values are relative to the SER reference states.
+    * **Activities with a reference state:** compared as chemical potentials.
+    * **Excluded model contributions** come from the dataset or from its tags, as defined in an ESPEI input YAML
+      found next to or above the data folder.
+    * **The score** is the RMS of (model − data) / ESPEI's standard deviation, shown as e.g. "thermo 5.1σ (76 pts)"
+      next to the ZPF score, with each dataset's own value in the list. On the Cu-Mg tutorial data it equals ESPEI's
+      own residuals (5.14σ over 76 points).
+    * **Not yet supported:** equilibrium-property data (counted as skipped).
 * **Optimize (binary invariants and congruent points, ternary tie triangles).** Moves a three-phase invariant (eutectic, peritectic, …)
   to a target temperature and/or target compositions of its three phases, or a congruent point (congruent melting
   or a congruent solid-state transformation) to a target temperature and composition, by adjusting the parameters
@@ -192,9 +213,20 @@ Run the tests with `.venv/bin/python -m pytest`.
     history lets you apply any earlier iteration instead, e.g. "a few steps in that direction", or revert to the
     start. Ctrl+Z works too. The change table shows each parameter's start value, value and Δ/limit; red means
     the parameter hit its limit.
-  * **Boundary nodes:** right-click a phase boundary line of a binary ▸ "Add boundary node", then drag the node. The
-    target is that boundary passing through the node: at the node's temperature, the phase's boundary composition
-    is solved as a two-phase equilibrium and compared with the node's x.
+  * **Boundary nodes:** right-click a phase boundary line ▸ "Add boundary node", then drag the node. The target is
+    that boundary passing through the node.
+    * **Binary:** at the node's temperature, the phase's boundary composition is solved as a two-phase equilibrium.
+    * **Ternary section:** the two-phase equilibrium is solved a short way into the region along the tie line from
+      the node. The residual is how far the tie line's end lies from the node, along the tie line.
+  * **Live drag** (on by default): pressing a target handle computes, once, how every target responds to every
+    chosen parameter, including the held features and the norm. That takes about a second on Cu-Mg.
+    * **While you drag:** the parameters follow from that linear model in well under a millisecond per mouse move.
+      Filled magenta dots show where the feature is predicted to be, and the diagram redraws when you pause.
+    * **Accuracy:** good within one per-iteration limit of change. Further out the dots stop following: release and
+      press again to re-linearize at the new parameters.
+    * **Undo:** each drag is one undo step.
+    * **Example:** a 12 K drag of the Cu-Mg eutectic predicted 992.9 K and the re-map gave 993.7 K, with the other
+      invariants held.
   * **Targets across views:** each target belongs to the diagram it was added on, which is shown in the target
     list. One run can mix targets from binary diagrams and from ternary sections at different temperatures. Run it
     from any diagram; "Map all views" refreshes the others afterwards.
@@ -217,6 +249,13 @@ Run the tests with `.venv/bin/python -m pytest`.
   * **Side effects:** only the targets are constrained. Other features (e.g. a neighbouring eutectic) can still move,
     so add the ones that matter as held targets or use "Hold everything else", and vary only the parameters of the
     phases taking part.
+* **ESPEI data from your targets and marks** (first version, to be refined with use):
+  * **Optimize ▸ Export as ESPEI data…** writes the targets, at their wanted positions, as ESPEI ZPF datasets, one
+    per system.
+  * **Right-click ▸ Mark data point here** records a point read off, for example, a literature image. It's
+    interpreted from the nearest computed boundary ("LIQUID boundary of LIQUID + FCC_A1") and collected in a "Marked
+    points" dataset. That dataset is drawn and scored like any ZPF data and saved with "Save marked points…".
+  * ESPEI's own dataset checker accepts both kinds of file.
 * **Compare with another TDB** (File menu): draws another file, such as a published assessment or an earlier
   version, as the grey ghost instead of the checkpoint. With ZPF data loaded, its score appears next to yours, e.g.
   "ZPF 700 J/mol (Cu-Mg-generated.tdb 1379)". Both databases stay compiled side by side, so redraws are not slowed.
@@ -277,6 +316,10 @@ first run includes process start-up.
 * **Map cross-check:** re-check a finished map with point equilibria (or the column-generation solver) on a coarse
   grid and mark lines where they disagree. This would matter if pycalphad's mapping fragility turns out to be a
   frequent problem.
+* **Comparison report** (PDF of views, scores, parameter changes, artifact checks): parked, needs discussion of what
+  is useful.
+* **Marked points / exported targets:** the first version is in; how points are interpreted and grouped into
+  tie-lines needs iterating with real use.
 * **Parameter ties:** keep e.g. L1 = 0 or a fixed b/a ratio during optimization (locks cover the common case).
 * **Literature points by hand + automatic classification:** you mark points on an image, and a model classifies
   them (liquidus, solvus, invariant, which phases) and proposes corrections. This would be an alternative to

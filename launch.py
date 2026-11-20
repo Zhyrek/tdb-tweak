@@ -1,7 +1,8 @@
 """One-click start of tdb-tweak on Windows, macOS and Linux.
 
 The first run creates a private environment (.venv next to this file) and installs tdb-tweak into it (needs an
-internet connection, a few minutes); later runs start the program directly.  Double-click the launcher for your
+internet connection, a few minutes); later runs start the program directly.  ``--update`` pulls the latest version
+first (git clones), ``--reinstall`` repeats the installation.  Double-click the launcher for your
 system: tdb-tweak.bat (Windows), tdb-tweak.command (macOS) or tdb-tweak.sh (Linux).
 """
 import os
@@ -37,10 +38,24 @@ def install():
     print("Done.", flush=True)
 
 
+def update():
+    """Pull the latest version (for a git clone); the next start reinstalls if the dependencies changed."""
+    if not os.path.isdir(os.path.join(HERE, ".git")):
+        print("This copy is not a git clone: download the latest version from "
+              "https://github.com/Zhyrek/tdb-tweak and replace this folder (keep .venv to skip reinstalling).")
+        return
+    try:
+        subprocess.check_call(["git", "-C", HERE, "pull", "--ff-only"])
+    except (OSError, subprocess.CalledProcessError) as ex:
+        print(f"Update failed ({ex}). Is git installed, and are there local changes?")
+
+
 def main():
+    if "--update" in sys.argv:
+        update()
     if "--reinstall" in sys.argv or not installed():
         install()
-    args = [a for a in sys.argv[1:] if a != "--reinstall"]
+    args = [a for a in sys.argv[1:] if a not in ("--reinstall", "--update")]
     if WIN and os.path.exists(PYW):
         # no console window for the program itself
         subprocess.Popen([PYW, "-m", "tdb_tweak", *args], cwd=HERE,

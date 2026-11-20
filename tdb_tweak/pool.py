@@ -12,7 +12,7 @@ from typing import Dict, List, Optional, Sequence
 _engine = None
 
 
-def _job(compute_text: str, param_names: Sequence[str], values: Dict[str, float], request, zpf):
+def _job(compute_text: str, param_names: Sequence[str], values: Dict[str, float], request, zpf, thermo=None):
     global _engine
     from .engine import Engine
     if _engine is None:
@@ -25,6 +25,12 @@ def _job(compute_text: str, param_names: Sequence[str], values: Dict[str, float]
             res.zpf = zpf_score(_engine, request, values, zpf)
         except Exception as ex:
             res.message = (res.message + "; " if res.message else "") + f"ZPF score: {ex}"
+    if thermo:
+        try:
+            from .thermo import thermo_score
+            res.thermo = thermo_score(_engine, request, values, thermo)
+        except Exception as ex:
+            res.message = (res.message + "; " if res.message else "") + f"thermo score: {ex}"
     return res
 
 
@@ -50,9 +56,9 @@ class MapPool:
         for _ in range(self.workers):
             ex.submit(_warm)
 
-    def submit(self, compute_text: str, param_names, values, request, zpf=None) -> Future:
+    def submit(self, compute_text: str, param_names, values, request, zpf=None, thermo=None) -> Future:
         return self._executor().submit(_job, compute_text, list(param_names), dict(values), request,
-                                       [d for d in (zpf or []) if d.enabled])
+                                       [d for d in (zpf or []) if d.enabled], [d for d in (thermo or []) if d.enabled])
 
     def shutdown(self):
         if self._ex is not None:

@@ -36,6 +36,8 @@ class ZPFScore:
     per_dataset: Dict[str, tuple] = field(default_factory=dict)    # path -> (rms, n)
     worst: List[tuple] = field(default_factory=list)                # (|DF|, label) largest few
     skipped: int = 0
+    per_point: Dict[tuple, float] = field(default_factory=dict)     # (path, tie-line index, vertex index) -> DF
+    per_tieline: Dict[tuple, float] = field(default_factory=dict)   # (path, tie-line index) -> largest |DF|
 
     def text(self) -> str:
         return f"ZPF {self.rms:.0f} J/mol ({self.n} pts)" if self.n else "ZPF: no matching data"
@@ -108,7 +110,8 @@ class _Phases:
 
 
 def driving_forces(engine, request, values: Dict[str, float], datasets: Sequence[ZPFDataset]):
-    """Driving force (J/mol) of every data vertex in a fixed order: [(dataset path, label, df or nan)].
+    """Driving force (J/mol) of every data vertex in a fixed order: [(dataset path, label, df or nan, point id)]
+    with point id = (path, tie-line index, vertex index).
 
     The order and length depend only on the data, so the list can be used as optimiser residuals; a vertex that
     cannot be evaluated at some parameter values is nan there."""
@@ -123,15 +126,15 @@ def driving_forces(engine, request, values: Dict[str, float], datasets: Sequence
     P = _Phases(engine, comps, models, prf, els)
     out = []
     for ds in data:
-        for tl in ds.tielines:
-            slots = []                                      # (vertex, base, fractions or None)
-            for vx in tl.vertices:
+        for i_tl, tl in enumerate(ds.tielines):
+            slots = []                                      # (vertex, base, fractions or None, vertex index)
+            for i_v, vx in enumerate(tl.vertices):
                 base = vx.phase.split("#")[0]
                 if base not in models:
                     continue
-                slots.append((vx, base, fractions_for(vx, els)))
+                slots.append((vx, base, fractions_for(vx, els), i_v))
             solved = {}
-            for i, (vx, base, fr) in enumerate(slots):
+            for i, (vx, base, fr, _) in enumerate(slots):
                 if fr is not None:
                     o = P.single(base, fr, tl.T)
                     if o is not None:
@@ -142,19 +145,20 @@ def driving_forces(engine, request, values: Dict[str, float], datasets: Sequence
             else:
                 mus = [o[1] for o in solved.values() if o[1] is not None]
             mu = np.mean(mus, axis=0) if mus else None
-            for i, (vx, base, fr) in enumerate(slots):
+            for i, (vx, base, fr, i_v) in enumerate(slots):
                 where = f"{ds.label}: {vx.phase}{'' if fr is not None else ' (composition unknown)'} at {tl.T:g} K"
+                pid = (ds.path, i_tl, i_v)
                 if mu is None:
-                    out.append((ds.path, where, float("nan")))
+                    out.append((ds.path, where, float("nan"), pid))
                 elif fr is not None:
                     if i in solved:
                         G, _, Xfull = solved[i]
-                        out.append((ds.path, where, float(mu @ Xfull - G)))
+                        out.append((ds.path, where, float(mu @ Xfull - G), pid))
                     else:
-                        out.append((ds.path, where, float("nan")))
+                        out.append((ds.path, where, float("nan"), pid))
                 else:
                     X, Y, Gs = P.samples(base, tl.T, pdens=200)
-                    out.append((ds.path, where, float(np.max(X @ mu - Gs))))
+                    out.append((ds.path, where, float(np.max(X @ mu - Gs)), pid))
     return out
 
 
@@ -163,13 +167,17 @@ def zpf_score(engine, request, values: Dict[str, float], datasets: Sequence[ZPFD
     if not dfs and not [d for d in matching(datasets, list(request.elements[:2] if request.kind == "binary"
                                                              else request.elements[:3])) if d.enabled]:
         return None
-    good = [(p, w, d) for p, w, d in dfs if np.isfinite(d)]
+    good = [(p, w, d) for p, w, d, _ in dfs if np.isfinite(d)]
+    per_point = {pid: d for _, _, d, pid in dfs if np.isfinite(d)}
+    per_tieline: Dict[tuple, float] = {}
+    for (path, i_tl, _), d in per_point.items():
+        per_tieline[(path, i_tl)] = max(per_tieline.get((path, i_tl), 0.0), abs(d))
     per: Dict[str, list] = {}
     for p, w, d in good:
         per.setdefault(p, []).append(d)
     per_ds = {p: (float(np.sqrt(np.mean(np.square(v)))), len(v)) for p, v in per.items()}
     if not good:
-        return ZPFScore(0.0, 0, per_ds, [], len(dfs))
+        return ZPFScore(0.0, 0, per_ds, [], len(dfs), per_point, per_tieline)
     worst = sorted(((abs(d), w) for p, w, d in good), key=lambda t: -t[0])[:8]
     return ZPFScore(float(np.sqrt(np.mean(np.square([d for _, _, d in good])))), len(good), per_ds, worst,
-                    len(dfs) - len(good))
+                    len(dfs) - len(good), per_point, per_tieline)
