@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "tdb-tweak"
+version = "0.1.0"
+description = "Hand-tune the parameters of a CALPHAD TDB against a live pycalphad phase diagram"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+dependencies = [
+    "pycalphad>=0.12,<0.13",
+    "PyQt6>=6.5",
+    "matplotlib>=3.8",
+    "numpy",
+    "scipy",
+]
+
+[project.optional-dependencies]
+cg = ["pycalphad-cg @ git+https://github.com/Zhyrek/pycalphad-cg"]
+test = ["pytest"]
+
+[project.scripts]
+tdb-tweak = "tdb_tweak.app:main"
+
+[tool.setuptools.packages.find]
+include = ["tdb_tweak*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
